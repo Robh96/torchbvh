@@ -1,0 +1,29 @@
+﻿site_name: torchbvh
+site_description: CUDA geometry primitives for PyTorch point-cloud workflows.
+site_url: https://torchbvh.readthedocs.io/
+repo_url: https://github.com/Robh96/torch_ibvh
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.tabs
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - User Guide: user_guide.md
+  - API Reference: api_reference.md
+  - Lifecycle And Gradients: lifecycle_and_gradients.md
+  - Performance: performance.md
+  - Examples: examples.md
+
+markdown_extensions:
+  - admonition
+  - fenced_code
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
