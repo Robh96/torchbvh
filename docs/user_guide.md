@@ -1,8 +1,10 @@
 # User Guide
 
-`torchbvh` expects CUDA float32 contiguous tensors, `D in {2, 3}`, and
-`k in {4, 8, 16}`. Callers provide finite inputs. Gradients do not flow through
-BVH construction, FPS, or discrete neighbor selection.
+`torchbvh` expects CUDA float32 tensors, `D in {2, 3}`, and `k in {4, 8, 16}`.
+Callers provide finite inputs. Public APIs accept non-contiguous PyTorch views
+and may make layout-only contiguous copies internally for CUDA kernels.
+Gradients do not flow through BVH construction, FPS, or discrete neighbor
+selection.
 
 ## Single-Sample k-NN
 
@@ -13,11 +15,11 @@ sorted ascending with their matching indices.
 import torch
 import torchbvh as tb
 
-points = torch.randn(4096, 3, device="cuda").contiguous()     # (N, D) float32
-query_pts = points.contiguous()                              # (N, D) float32
+points = torch.randn(4096, 3, device="cuda")                 # (N, D) float32
+query_pts = points                                           # (N, D) float32
 
 bvh = tb.BVH(points)
-idx, dist_sq = bvh.knn(query_pts, k=8)                       # (N, 8) int32, (N, 8) float32
+idx, dist_sq = bvh.knn(query_pts, k=8)                       # (N, 8) int64, (N, 8) float32
 ```
 
 The class owns the native handle. Use the context-manager form when lifetime
@@ -34,8 +36,8 @@ For equal-size batches, pass `(B, N, D)` points. Query points use the same batch
 dimension and return local per-sample indices.
 
 ```python
-points = torch.randn(4, 4096, 3, device="cuda").contiguous()  # (B, N, D) float32
-query_pts = points.contiguous()                              # (B, N, D) float32
+points = torch.randn(4, 4096, 3, device="cuda")              # (B, N, D) float32
+query_pts = points                                           # (B, N, D) float32
 
 bvh = tb.BVH(points)
 idx, dist_sq = bvh.knn(query_pts, k=8)                       # (B, N, 8), (B, N, 8)
@@ -47,10 +49,10 @@ For variable-size samples, pack source points as `(total_N, D)` and provide
 1-D int64 start offsets. Ragged handles support k-NN only.
 
 ```python
-points = torch.randn(9000, 3, device="cuda").contiguous()     # (total_N, D) float32
+points = torch.randn(9000, 3, device="cuda")                 # (total_N, D) float32
 batch_offsets = torch.tensor([0, 2000, 5500, 9000],           # (B + 1,) int64
                              device="cuda", dtype=torch.int64)
-query_pts = torch.randn(7200, 3, device="cuda").contiguous()  # (total_M, D) float32
+query_pts = torch.randn(7200, 3, device="cuda")              # (total_M, D) float32
 query_offsets = torch.tensor([0, 1800, 4200, 7200],           # (B + 1,) int64
                              device="cuda", dtype=torch.int64)
 
@@ -67,10 +69,10 @@ Use MLS when features live on source points and query positions may be displaced
 Gradients flow to `features` and live `displaced_pts`.
 
 ```python
-points = torch.randn(4096, 3, device="cuda").contiguous()             # (N, D) float32
-displaced_pts = (points + 0.01 * torch.randn_like(points)).contiguous() # (N, D) float32
+points = torch.randn(4096, 3, device="cuda")                         # (N, D) float32
+displaced_pts = points + 0.01 * torch.randn_like(points)              # (N, D) float32
 displaced_pts.requires_grad_(True)
-features = torch.randn(4096, 16, device="cuda", requires_grad=True).contiguous() # (N, Ch) float32
+features = torch.randn(4096, 16, device="cuda", requires_grad=True)   # (N, Ch) float32
 
 bvh = tb.BVH(points)
 interpolated = bvh.interpolate(displaced_pts, features, k=8)          # (N, Ch) float32
@@ -88,7 +90,7 @@ the operator, not PyTorch autograd metadata.
 ```python
 interpolated, field_gradient = bvh.interpolate(
     displaced_pts, features, k=8, return_grad=True
-)                                                                    # (N, Ch), (N, Ch, D)
+)                                                                    # (N, Ch), (N, D, Ch)
 ```
 
 The same calls support fixed-size batches with `(B, N, D)` geometry and
@@ -100,10 +102,10 @@ For multihead displaced queries, build one BVH per sample over `pos` and reuse i
 across all `H` heads. The helper owns that shape choreography.
 
 ```python
-pos = torch.randn(2, 4096, 3, device="cuda").contiguous()       # (B, N, D) float32
-rho = torch.randn(2, 4096, 4, 3, device="cuda").contiguous()    # (B, N, H, D) float32
+pos = torch.randn(2, 4096, 3, device="cuda")                    # (B, N, D) float32
+rho = torch.randn(2, 4096, 4, 3, device="cuda")                 # (B, N, H, D) float32
 displaced_queries = pos[:, :, None, :] + rho                    # (B, N, H, D) float32
-values = torch.randn(2, 4096, 4, 32, device="cuda").contiguous() # (B, N, H, Ch) float32
+values = torch.randn(2, 4096, 4, 32, device="cuda")             # (B, N, H, Ch) float32
 
 idx, dist_sq = tb.query_displaced_knn(
     pos, displaced_queries, k=8, return_positions=False
@@ -122,7 +124,7 @@ query geometry are discrete query inputs for these helpers.
 `(B, N, D)` inputs and returns geometry plus assignment metadata.
 
 ```python
-points = torch.randn(4, 4096, 3, device="cuda").contiguous()    # (B, N, D) float32
+points = torch.randn(4, 4096, 3, device="cuda")                 # (B, N, D) float32
 result = tb.fps(points, target_tokens=1024)
 
 result.indices                     # (B, M) int64, selected source indices

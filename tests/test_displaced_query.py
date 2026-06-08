@@ -75,15 +75,6 @@ def _old_style_weighted_mean_reference(values, indices, squared_distances):
         (lambda p: p[:1], lambda q: q, "batch size"),
         (lambda p: p, lambda q: q[:, :3], "point dimension"),
         (lambda p: p, lambda q: q.double(), "float32"),
-        (
-            lambda p: torch.empty(
-                (p.size(0), p.size(1), p.size(2) + 1),
-                device=p.device,
-                dtype=p.dtype,
-            )[:, :, : p.size(2)],
-            lambda q: q,
-            "contiguous",
-        ),
     ],
 )
 def test_query_displaced_knn_shape_validation(bad_pos, bad_q, match):
@@ -337,7 +328,7 @@ def test_interpolate_displaced_exact_hit_duplicate_weighted_mean_and_gradient_bo
     assert q.grad is None
 
 
-def test_gather_neighbor_values_rejects_invalid_values_dtype_device_and_contiguity():
+def test_gather_neighbor_values_rejects_invalid_values_dtype_and_device():
     assert torch.cuda.is_available()
     values = torch.randn((2, 6, 3, 4), device="cuda", dtype=torch.float32).contiguous()
     indices = torch.zeros((2, 6, 3, 2), device="cuda", dtype=torch.int64).contiguous()
@@ -346,10 +337,6 @@ def test_gather_neighbor_values_rejects_invalid_values_dtype_device_and_contigui
         torchbvh.gather_neighbor_values(values.double().contiguous(), indices)
     with pytest.raises(ValueError, match="values must be a CUDA tensor"):
         torchbvh.gather_neighbor_values(values.cpu().contiguous(), indices.cpu())
-
-    noncontiguous = torch.empty((2, 6, 3, 8), device="cuda", dtype=torch.float32)[:, :, :, ::2]
-    with pytest.raises(ValueError, match="values must be contiguous"):
-        torchbvh.gather_neighbor_values(noncontiguous, indices)
 
 
 def test_interpolate_displaced_rejects_unsupported_reduction():

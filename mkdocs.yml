@@ -14,6 +14,7 @@ theme:
 nav:
   - Home: index.md
   - User Guide: user_guide.md
+  - Algorithms: algorithms.md
   - API Reference: api_reference.md
   - Lifecycle And Gradients: lifecycle_and_gradients.md
   - Performance: performance.md

@@ -307,9 +307,10 @@ Build/query tests:
 Validation tests:
 
 - Reject invalid handle types and destroyed batched handles clearly.
-- Reject non-CUDA tensors, non-contiguous tensors, non-float32 point/query tensors, bad
-  ranks, unsupported dimensions, mismatched batch sizes, mismatched `D`, and too few
-  points for the requested `k`.
+- Reject non-CUDA tensors, non-float32 point/query tensors, bad ranks, unsupported
+  dimensions, mismatched batch sizes, mismatched `D`, and too few points for the
+  requested `k`. Accept non-contiguous public inputs and compare them against
+  contiguous equivalents.
 - Reject single-sample handles passed to batched APIs and batched handles passed to
   single-sample APIs unless a wrapper explicitly documents support.
 - For fixed-size batching, reject ragged inputs or offset-based arguments until the ragged
@@ -450,12 +451,13 @@ Ragged build/query tests:
 
 Ragged validation tests:
 
-- Reject bad offsets: wrong rank, wrong dtype, wrong device, non-contiguous tensors,
-  first offset not zero, final offset not matching the packed tensor length, and
-  non-strictly-increasing offsets.
-- Reject non-CUDA tensors, non-contiguous point/query tensors, non-float32 point/query
-  tensors, unsupported dimensions, mismatched batch sizes, mismatched dimensions, mixed
-  devices, unsupported `k`, and source samples with fewer than `k` points.
+- Reject bad offsets: wrong rank, wrong dtype, wrong device, first offset not zero,
+  final offset not matching the packed tensor length, and non-strictly-increasing
+  offsets.
+- Reject non-CUDA tensors, non-float32 point/query tensors, unsupported dimensions,
+  mismatched batch sizes, mismatched dimensions, mixed devices, unsupported `k`, and
+  source samples with fewer than `k` points. Accept non-contiguous public inputs and
+  compare them against contiguous equivalents.
 - Reject fixed-size batched and single-sample handles passed to ragged query APIs.
 - Destroyed ragged handles should raise a clear destroyed-handle error.
 

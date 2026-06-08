@@ -10,7 +10,7 @@ from ._constants import (
 )
 from ._handles import _temporary_bvh
 from ._query import build_bvh, build_bvh_batched, query_knn, query_knn_batched
-from ._validation import _validate_supported_k
+from ._validation import _as_contiguous, _validate_supported_k
 
 
 _MLS_FLATTENED_CHUNK_SIZE = 16384
@@ -219,6 +219,10 @@ def _validate_mls_inputs(
         raise ValueError("bvh_mls_interpolate: points, displaced_points, and features must be on the same device")
     if points.dtype != torch.float32 or displaced_points.dtype != torch.float32:
         raise ValueError("bvh_mls_interpolate: points and displaced_points must be float32")
+    if features.dtype != torch.float32:
+        raise ValueError("bvh_mls_interpolate: features must be float32")
+    if not points.is_cuda or not displaced_points.is_cuda or not features.is_cuda:
+        raise ValueError("bvh_mls_interpolate: points, displaced_points, and features must be CUDA tensors")
 
 
 def _validate_batched_mls_inputs(
@@ -254,8 +258,6 @@ def _validate_batched_mls_inputs(
         raise ValueError("bvh_mls_interpolate_batched: features must be float32")
     if not points.is_cuda or not displaced_points.is_cuda or not features.is_cuda:
         raise ValueError("bvh_mls_interpolate_batched: points, displaced_points, and features must be CUDA tensors")
-    if not points.is_contiguous() or not displaced_points.is_contiguous() or not features.is_contiguous():
-        raise ValueError("bvh_mls_interpolate_batched: points, displaced_points, and features must be contiguous")
 
 
 def _linear_mls_chunk(
@@ -497,6 +499,9 @@ def bvh_mls_interpolate(
     the interpolated field, not a PyTorch autograd gradient.
     """
     _validate_mls_inputs(points, displaced_points, features, k)
+    points = _as_contiguous(points)
+    displaced_points = _as_contiguous(displaced_points)
+    features = _as_contiguous(features)
     indices, squared_distances, neighbor_positions = BVHQuery.apply(points, displaced_points, k)
     result = _linear_mls_indexed_chunked_fused_forward(
         displaced_points,
@@ -525,6 +530,9 @@ def bvh_mls_interpolate_batched(
     returns ``interpolated`` only.
     """
     _validate_batched_mls_inputs(points, displaced_points, features, k)
+    points = _as_contiguous(points)
+    displaced_points = _as_contiguous(displaced_points)
+    features = _as_contiguous(features)
     indices, squared_distances, neighbor_positions = BatchedBVHQuery.apply(points, displaced_points, k)
     result = _linear_mls_batched_indexed_chunked_fused_forward(
         displaced_points,
@@ -588,9 +596,10 @@ def _bvh_mls_interpolate_batched_head_banked(
         raise ValueError("_bvh_mls_interpolate_batched_head_banked: features_by_head must be float32")
     if not points.is_cuda or not displaced_by_head.is_cuda or not features_by_head.is_cuda:
         raise ValueError("_bvh_mls_interpolate_batched_head_banked: inputs must be CUDA tensors")
-    if not points.is_contiguous() or not displaced_by_head.is_contiguous() or not features_by_head.is_contiguous():
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: inputs must be contiguous")
 
+    points = _as_contiguous(points)
+    displaced_by_head = _as_contiguous(displaced_by_head)
+    features_by_head = _as_contiguous(features_by_head)
     points_detached = points.detach().contiguous()
     query = displaced_by_head.detach().reshape(B, H * M, D).contiguous()
 

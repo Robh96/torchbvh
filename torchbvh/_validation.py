@@ -8,11 +8,25 @@ def _validate_supported_k(prefix: str, k: int) -> None:
         raise ValueError(f"{prefix}: k must be 4, 8, or 16")
 
 
-def _validate_cuda_float32_contiguous(prefix: str, tensor: torch.Tensor, name: str) -> None:
+def _as_contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _as_contiguous_int64(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype != torch.int64:
+        return tensor
+    return _as_contiguous(tensor)
+
+
+def _validate_cuda_float32(prefix: str, tensor: torch.Tensor, name: str) -> None:
     if not tensor.is_cuda:
         raise ValueError(f"{prefix}: {name} must be a CUDA tensor")
     if tensor.dtype != torch.float32:
         raise ValueError(f"{prefix}: {name} must be float32")
+
+
+def _validate_cuda_float32_contiguous(prefix: str, tensor: torch.Tensor, name: str) -> None:
+    _validate_cuda_float32(prefix, tensor, name)
     if not tensor.is_contiguous():
         raise ValueError(f"{prefix}: {name} must be contiguous")
 

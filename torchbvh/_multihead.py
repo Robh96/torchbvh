@@ -5,7 +5,7 @@ import torch
 from ._constants import EXACT_DISTANCE_EPSILON, SUPPORTED_DIMS
 from ._handles import _temporary_bvh
 from ._query import build_bvh_batched, query_knn_batched
-from ._validation import _validate_cuda_float32_contiguous
+from ._validation import _as_contiguous, _as_contiguous_int64, _validate_cuda_float32
 
 __all__ = [
     "query_displaced_knn",
@@ -29,8 +29,8 @@ def _validate_displaced_inputs(pos: torch.Tensor, q: torch.Tensor, prefix: str) 
         raise ValueError(f"{prefix}: q last dimension must match pos")
     if q.size(2) < 1:
         raise ValueError(f"{prefix}: q must contain at least one head")
-    _validate_cuda_float32_contiguous(prefix, pos, "pos")
-    _validate_cuda_float32_contiguous(prefix, q, "q")
+    _validate_cuda_float32(prefix, pos, "pos")
+    _validate_cuda_float32(prefix, q, "q")
     if pos.device != q.device:
         raise ValueError(f"{prefix}: pos and q must be on the same device")
 
@@ -50,6 +50,8 @@ def query_displaced_knn(
     Morton-sorted traversal path for high-volume query locality.
     """
     _validate_displaced_inputs(pos, q, "query_displaced_knn")
+    pos = _as_contiguous(pos)
+    q = _as_contiguous(q)
     batch_size, n, heads, dim = q.shape
     flat_queries = q.reshape(batch_size, n * heads, dim).contiguous()
     source_pos = pos.detach().contiguous()
@@ -99,13 +101,13 @@ def gather_neighbor_values(values: torch.Tensor, indices: torch.Tensor) -> torch
         raise ValueError("gather_neighbor_values: indices head dimension must match values")
     if values.size(3) < 1:
         raise ValueError("gather_neighbor_values: values must have at least one channel")
-    _validate_cuda_float32_contiguous("gather_neighbor_values", values, "values")
+    _validate_cuda_float32("gather_neighbor_values", values, "values")
     if indices.dtype != torch.int64:
         raise ValueError("gather_neighbor_values: indices must be int64")
     if values.device != indices.device:
         raise ValueError("gather_neighbor_values: values and indices must be on the same device")
-    if not indices.is_contiguous():
-        raise ValueError("gather_neighbor_values: indices must be contiguous")
+    values = _as_contiguous(values)
+    indices = _as_contiguous_int64(indices)
     if indices.numel() > 0:
         amin, amax = torch.aminmax(indices)
         if int(amin) < 0 or int(amax) >= values.size(1):
@@ -168,9 +170,12 @@ def interpolate_displaced(
         raise ValueError("interpolate_displaced: values head dimension must match q")
     if values.size(3) < 1:
         raise ValueError("interpolate_displaced: values must have at least one channel")
-    _validate_cuda_float32_contiguous("interpolate_displaced", values, "values")
+    _validate_cuda_float32("interpolate_displaced", values, "values")
     if values.device != pos.device:
         raise ValueError("interpolate_displaced: values must be on the same device as pos")
+    pos = _as_contiguous(pos)
+    q = _as_contiguous(q)
+    values = _as_contiguous(values)
 
     indices, squared_distances = query_displaced_knn(
         pos,

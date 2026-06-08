@@ -81,7 +81,6 @@ def test_batched_api_accepts_legacy_mapping_and_rejects_single_sample_handle():
         (lambda q: q[:1], "batch size"),
         (lambda q: torch.rand((2, 4, 3), device="cuda"), "last dimension"),
         (lambda q: q.double(), "float32"),
-        (lambda q: torch.empty((2, 4, 4), device="cuda", dtype=q.dtype)[:, :, :2], "contiguous"),
     ],
 )
 def test_batched_query_validation_errors(bad_query, match):
@@ -113,15 +112,13 @@ def test_batched_handle_idempotent_double_destroy():
     assert bvh.destroyed
 
 
-def test_batched_build_rejects_wrong_rank_dtype_device_and_noncontiguous():
+def test_batched_build_rejects_wrong_rank_dtype_and_device():
     assert torch.cuda.is_available()
     points = torch.rand((2, 16, 2), device="cuda", dtype=torch.float32).contiguous()
 
-    with pytest.raises(RuntimeError, match="shape"):
+    with pytest.raises(ValueError, match="shape"):
         torchbvh.build_bvh_batched(points[0])
-    with pytest.raises(RuntimeError, match="float32"):
+    with pytest.raises(ValueError, match="float32"):
         torchbvh.build_bvh_batched(points.double())
-    with pytest.raises(RuntimeError, match="contiguous"):
-        torchbvh.build_bvh_batched(points.transpose(0, 1))
-    with pytest.raises(RuntimeError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA"):
         torchbvh.build_bvh_batched(points.cpu())

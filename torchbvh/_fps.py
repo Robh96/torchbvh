@@ -6,6 +6,7 @@ import torch
 
 from . import _C
 from ._query import build_bvh, build_bvh_batched
+from ._validation import _as_contiguous
 
 
 @dataclass
@@ -46,8 +47,6 @@ def _validate_points_and_m(
         raise ValueError(f"{prefix}: points must be float32")
     if not points.is_cuda:
         raise ValueError(f"{prefix}: points must be a CUDA tensor")
-    if not points.is_contiguous():
-        raise ValueError(f"{prefix}: points must be contiguous")
     if M < 1 or M > points.size(n_axis):
         raise ValueError(f"{prefix}: target token count must be in [1, N]")
     if seed < -1 or seed >= points.size(n_axis):
@@ -149,6 +148,7 @@ def _fps_exact_full_scan(points: torch.Tensor, M: int, seed: int = 0) -> FPSResu
         int(seed),
         allow_batched=True,
     )
+    points = _as_contiguous(points)
     was_single = points.dim() == 2
     points_batched = points.unsqueeze(0) if was_single else points
     seed_indices = _resolve_seed_batched(points_batched, int(seed)).contiguous()
@@ -211,6 +211,7 @@ def _fps_exact_bucketed(
     if bucket_size < 1:
         raise ValueError("_fps_exact_bucketed: bucket_size must be >= 1")
 
+    points = _as_contiguous(points)
     was_single = points.dim() == 2
     points_batched = points.unsqueeze(0) if was_single else points
     seed_indices = _resolve_seed_batched(points_batched, int(seed)).contiguous()
@@ -326,6 +327,7 @@ def _fps_approx_bucketed(
     if alpha < 0.0:
         raise ValueError("_fps_approx_bucketed: alpha must be nonnegative")
 
+    points = _as_contiguous(points)
     was_single = points.dim() == 2
     points_batched = points.unsqueeze(0) if was_single else points
     seed_indices = _resolve_seed_batched(points_batched, int(seed)).contiguous()
@@ -445,6 +447,7 @@ def fps(
       ``alpha``.
     """
     _validate_points_and_m("fps", points, int(target_tokens), int(seed), allow_batched=True)
+    points = _as_contiguous(points)
     requested_mode = str(mode)
 
     if requested_mode == "exact_bucketed":

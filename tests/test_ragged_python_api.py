@@ -89,7 +89,6 @@ def test_ragged_query_rejects_other_handle_types():
         (lambda o: o.view(1, -1), "shape"),
         (lambda o: o.to(torch.int32), "int64"),
         (lambda o: o.cpu(), "CUDA"),
-        (lambda o: torch.empty((4, 2), device="cuda", dtype=torch.int64)[:, 0], "contiguous"),
         (lambda o: _offsets([1, 4, 8]), "start at 0"),
         (lambda o: _offsets([0, 4, 7]), "final offset"),
         (lambda o: _offsets([0, 8, 8]), "strictly increasing"),
@@ -109,7 +108,6 @@ def test_ragged_build_rejects_bad_offsets(bad_offsets, match):
         (lambda p: p.view(1, 8, 2), "shape"),
         (lambda p: torch.rand((8, 4), device="cuda"), "D must be 2 or 3"),
         (lambda p: p.double(), "float32"),
-        (lambda p: torch.empty((8, 3), device="cuda", dtype=p.dtype)[:, :2], "contiguous"),
         (lambda p: p.cpu(), "CUDA"),
     ],
 )
@@ -128,7 +126,6 @@ def test_ragged_build_rejects_bad_points(bad_points, match):
         (lambda q: q.view(1, 8, 2), "shape"),
         (lambda q: torch.rand((8, 3), device="cuda"), "second dimension"),
         (lambda q: q.double(), "float32"),
-        (lambda q: torch.empty((8, 3), device="cuda", dtype=q.dtype)[:, :2], "contiguous"),
         (lambda q: q.cpu(), "CUDA"),
     ],
 )

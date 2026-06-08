@@ -8,6 +8,7 @@ from ._query import (
     _build_bvh_single,
     query_knn,
 )
+from ._validation import _as_contiguous, _as_contiguous_int64
 
 
 class BVH:
@@ -31,12 +32,16 @@ class BVH:
         if batch_offsets is not None:
             if points.dim() != 2:
                 raise ValueError("BVH: ragged mode requires 2-D points (total_N, D)")
+            points = _as_contiguous(points)
+            batch_offsets = _as_contiguous_int64(batch_offsets)
             self._handle: BVHHandle | BatchedBVHHandle | RaggedBVHHandle = _build_bvh_ragged(
                 points, batch_offsets
             )
         elif points.dim() == 3:
+            points = _as_contiguous(points)
             self._handle = _build_bvh_batched(points)
         elif points.dim() == 2:
+            points = _as_contiguous(points)
             self._handle = _build_bvh_single(points)
         else:
             raise ValueError("BVH: points must have shape (N, D) or (B, N, D)")

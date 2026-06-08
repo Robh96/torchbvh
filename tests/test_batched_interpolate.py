@@ -150,7 +150,7 @@ def test_batched_mls_gradient_boundary():
     assert torch.isfinite(features.grad).all()
 
 
-def test_batched_mls_rejects_non_contiguous_inputs():
+def test_batched_mls_accepts_non_contiguous_inputs():
     assert torch.cuda.is_available()
     points, features = _make_batched_cloud()
     displaced = (points[:, 3:11, :] + 0.02).contiguous()
@@ -158,5 +158,6 @@ def test_batched_mls_rejects_non_contiguous_inputs():
     padded[..., : points.shape[-1]] = points
     points_non_contiguous = padded[..., : points.shape[-1]]
 
-    with pytest.raises(ValueError, match="contiguous"):
-        torchbvh.bvh_mls_interpolate_batched(points_non_contiguous, displaced, features)
+    expected = torchbvh.bvh_mls_interpolate_batched(points, displaced, features)
+    actual = torchbvh.bvh_mls_interpolate_batched(points_non_contiguous, displaced, features)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)

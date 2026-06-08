@@ -3,6 +3,7 @@ from collections.abc import Mapping
 import torch
 
 from . import _C
+from ._constants import SUPPORTED_DIMS
 from ._handles import (
     BVHHandle,
     BatchedBVHHandle,
@@ -12,7 +13,9 @@ from ._handles import (
     _ragged_bvh_data,
 )
 from ._validation import (
-    _validate_cuda_float32_contiguous,
+    _as_contiguous,
+    _as_contiguous_int64,
+    _validate_cuda_float32,
     _validate_offsets,
     _validate_ragged_points,
     _validate_supported_k,
@@ -24,14 +27,28 @@ from ._validation import (
 # ---------------------------------------------------------------------------
 
 def _build_bvh_single(points: torch.Tensor) -> BVHHandle:
+    if points.dim() != 2:
+        raise ValueError("build_bvh: points must have shape (N, D)")
+    if points.size(1) not in SUPPORTED_DIMS:
+        raise ValueError("build_bvh: D must be 2 or 3")
+    _validate_cuda_float32("build_bvh", points, "points")
+    points = _as_contiguous(points)
     return BVHHandle(_C.build_bvh(points))
 
 
 def _build_bvh_batched(points: torch.Tensor) -> BatchedBVHHandle:
+    if points.dim() != 3:
+        raise ValueError("build_bvh_batched: points must have shape (B, N, D)")
+    if points.size(2) not in SUPPORTED_DIMS:
+        raise ValueError("build_bvh_batched: D must be 2 or 3")
+    _validate_cuda_float32("build_bvh_batched", points, "points")
+    points = _as_contiguous(points)
     return BatchedBVHHandle(_C.build_bvh_batched(points))
 
 
 def _build_bvh_ragged(points: torch.Tensor, batch_offsets: torch.Tensor) -> RaggedBVHHandle:
+    points = _as_contiguous(points)
+    batch_offsets = _as_contiguous_int64(batch_offsets)
     offsets = _validate_ragged_points("build_bvh", points, batch_offsets)
     handles = [
         _build_bvh_single(points[offsets[batch] : offsets[batch + 1]].contiguous())
@@ -96,10 +113,17 @@ def _query_knn_single(
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate_supported_k("query_knn", k)
     data = _bvh_data(bvh, "query_knn")
+    if query_points.dim() != 2:
+        raise ValueError("query_knn: query_points must have shape (M, D)")
+    if query_points.size(1) != data["dim"]:
+        raise ValueError("query_knn: query_points second dimension must match BVH dim")
+    _validate_cuda_float32("query_knn", query_points, "query_points")
+    if query_points.device != data["sorted_indices"].device:
+        raise ValueError("query_knn: query_points must be on the same device as the BVH")
+    query_points = _as_contiguous(query_points)
     if sort_queries:
         from ._reorder import morton_sort_queries_batched
 
-        query_points = query_points.contiguous()
         query_batch = query_points.unsqueeze(0)
         sort_perm, _ = morton_sort_queries_batched(
             query_batch,
@@ -130,6 +154,7 @@ def _query_knn_single(
         return indices, squared_distances
 
     _validate_single_source_points("query_knn", data, source_points)
+    source_points = _as_contiguous(source_points)
     return indices, squared_distances, source_points[indices]
 
 
@@ -140,6 +165,9 @@ def _validate_single_source_points(prefix: str, data: Mapping, source_points: to
         raise ValueError(f"{prefix}: source_points first dimension must match BVH num_leaves")
     if source_points.size(1) != data["dim"]:
         raise ValueError(f"{prefix}: source_points second dimension must match BVH dim")
+    _validate_cuda_float32(prefix, source_points, "source_points")
+    if source_points.device != data["sorted_indices"].device:
+        raise ValueError(f"{prefix}: source_points must be on the same device as the BVH")
 
 
 def _validate_batched_source_points(prefix: str, data: Mapping, source_points: torch.Tensor) -> None:
@@ -151,7 +179,7 @@ def _validate_batched_source_points(prefix: str, data: Mapping, source_points: t
         raise ValueError(f"{prefix}: source_points second dimension must match BVH num_leaves")
     if source_points.size(2) != data["dim"]:
         raise ValueError(f"{prefix}: source_points last dimension must match BVH dim")
-    _validate_cuda_float32_contiguous(prefix, source_points, "source_points")
+    _validate_cuda_float32(prefix, source_points, "source_points")
     if source_points.device != data["sorted_indices"].device:
         raise ValueError(f"{prefix}: source_points must be on the same device as the BVH")
 
@@ -183,9 +211,10 @@ def _query_knn_batched(
         raise ValueError("query_knn: query_points batch size must match BVH batch_size")
     if query_points.size(2) != data["dim"]:
         raise ValueError("query_knn: query_points last dimension must match BVH dim")
-    _validate_cuda_float32_contiguous("query_knn", query_points, "query_points")
+    _validate_cuda_float32("query_knn", query_points, "query_points")
     if query_points.device != data["sorted_indices"].device:
         raise ValueError("query_knn: query_points must be on the same device as the BVH")
+    query_points = _as_contiguous(query_points)
 
     if sort_queries:
         from ._reorder import morton_sort_queries_batched
@@ -222,6 +251,7 @@ def _query_knn_batched(
         return indices, squared_distances
 
     _validate_batched_source_points("query_knn", data, source_points)
+    source_points = _as_contiguous(source_points)
     neighbor_positions = _gather_batched_neighbor_positions(
         source_points,
         indices,
@@ -245,7 +275,7 @@ def _validate_ragged_source_points(
         raise ValueError(f"{prefix}: source_points first dimension must match BVH total_N")
     if source_points.size(1) != data["dim"]:
         raise ValueError(f"{prefix}: source_points second dimension must match BVH dim")
-    _validate_cuda_float32_contiguous(prefix, source_points, "source_points")
+    _validate_cuda_float32(prefix, source_points, "source_points")
     if source_points.device != device:
         raise ValueError(f"{prefix}: source_points must be on the same device as the BVH")
 
@@ -265,9 +295,11 @@ def _query_knn_ragged(
         raise ValueError("query_knn: ragged query_points must have shape (total_M, D)")
     if query_points.size(1) != data["dim"]:
         raise ValueError("query_knn: query_points second dimension must match BVH dim")
-    _validate_cuda_float32_contiguous("query_knn", query_points, "query_points")
+    _validate_cuda_float32("query_knn", query_points, "query_points")
     if query_points.device != data["batch_offsets"].device:
         raise ValueError("query_knn: query_points must be on the same device as the BVH")
+    query_points = _as_contiguous(query_points)
+    query_offsets = _as_contiguous_int64(query_offsets)
 
     q_offsets = _validate_offsets(
         "query_knn",
@@ -291,6 +323,7 @@ def _query_knn_ragged(
             total_rows=batch_offsets[-1],
             device=query_points.device,
         )
+        source_points = _as_contiguous(source_points)
 
     all_indices = []
     all_distances = []
