@@ -11,19 +11,7 @@ skip message instead of running the CUDA cells.
 
 | Notebook | Demonstrates |
 | --- | --- |
-| [`basic_bvh_knn.ipynb`](https://github.com/Robh96/torch_ibvh/blob/main/examples/basic_bvh_knn.ipynb) | local point-neighborhood feature aggregation with `BVH(points)` and `bvh.knn(...)` |
-| [`mls_interpolation.ipynb`](https://github.com/Robh96/torch_ibvh/blob/main/examples/mls_interpolation.ipynb) | MLS feature sampling at learned offset positions, including `return_grad=True` field gradients |
-| [`batched_displaced_query.ipynb`](https://github.com/Robh96/torch_ibvh/blob/main/examples/batched_displaced_query.ipynb) | a tiny multihead displaced-query block with `query_displaced_knn`, `gather_neighbor_values`, and `interpolate_displaced` |
-| [`fps_downsampling_geometry.ipynb`](https://github.com/Robh96/torch_ibvh/blob/main/examples/fps_downsampling_geometry.ipynb) | point-cloud downsampling with `fps(...)` |
-
-## Run Locally
-
-From the repository root:
-
-```bash
-python -m jupyter nbconvert --to notebook --execute examples/basic_bvh_knn.ipynb --output basic_bvh_knn.executed.ipynb
-```
-
-Use the same command with another notebook filename to execute the other examples.
-The generated `.executed.ipynb` files are local outputs and are not required by the
-documentation site build.
+| [`basic_bvh_knn.ipynb`](https://github.com/Robh96/torchbvh/blob/main/examples/basic_bvh_knn.ipynb) | local point-neighborhood feature aggregation with `BVH(points)` and `bvh.knn(...)` |
+| [`mls_interpolation.ipynb`](https://github.com/Robh96/torchbvh/blob/main/examples/mls_interpolation.ipynb) | MLS feature sampling at learned offset positions, including `return_grad=True` field gradients |
+| [`batched_displaced_query.ipynb`](https://github.com/Robh96/torchbvh/blob/main/examples/batched_displaced_query.ipynb) | a tiny multihead displaced-query block with `query_displaced_knn`, `gather_neighbor_values`, and `interpolate_displaced` |
+| [`fps_downsampling_geometry.ipynb`](https://github.com/Robh96/torchbvh/blob/main/examples/fps_downsampling_geometry.ipynb) | point-cloud downsampling with `fps(...)` |
