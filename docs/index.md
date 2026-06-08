@@ -30,11 +30,11 @@ See `benchmarks/third_party_algorithm_comparison.ipynb` for optional comparisons
 ## Install
 
 ```bash
-pip install -e . --no-build-isolation
+pip install torchbvh
 ```
 
-`--no-build-isolation` is required so `setup.py` can import the PyTorch in your
-environment.
+`torchbvh` builds a PyTorch CUDA extension. Source installs require PyTorch, a
+compatible CUDA toolkit/NVCC, and a supported host compiler in the build environment.
 
 ## Quickstart
 

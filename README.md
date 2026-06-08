@@ -28,19 +28,15 @@ See `benchmarks/third_party_algorithm_comparison.ipynb` for more detailed compar
 ## Install
 
 ```bash
-pip install -e . --no-build-isolation
+pip install torchbvh
 ```
+
+`torchbvh` builds a PyTorch CUDA extension. Source installs require PyTorch, a
+compatible CUDA toolkit/NVCC, and a supported host compiler in the build environment.
 
 ## Docs
 
-Documentation is intended to be hosted at
-[torchbvh.readthedocs.io](https://torchbvh.readthedocs.io/). The link is inactive until
-the repository is public and the Read the Docs project has been activated.
-
-```bash
-pip install -r requirements-docs.txt && python -m mkdocs serve
-```
-
+Documentation can be found at [torchbvh.readthedocs.io](https://torchbvh.readthedocs.io/).
 
 ## Quickstart
 

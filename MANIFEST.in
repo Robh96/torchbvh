@@ -1,0 +1,14 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include torchbvh/csrc *.cpp *.cu *.cuh
+recursive-include docs *.md
+recursive-include examples *.ipynb
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.pyd
+global-exclude *.so
+global-exclude *.dll
+global-exclude *.obj
+global-exclude *.exp
+global-exclude *.lib
