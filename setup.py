@@ -34,7 +34,7 @@ def _detect_gencode_flag():
 
 setup(
     name="torchbvh",
-    version="0.1.0",
+    version="0.1.1",
     description="GPU-native BVH, k-NN, MLS interpolation, and FPS primitives for PyTorch.",
     long_description=README,
     long_description_content_type="text/markdown",
