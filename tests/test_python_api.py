@@ -156,6 +156,7 @@ def test_public_package_surface_after_cleanup():
         "build_bvh",
         "query_knn",
         "mls_interpolate",
+        "bvh_mls_interpolate_batched_heads",
         "SUPPORTED_K",
         "SUPPORTED_DIMS",
     }

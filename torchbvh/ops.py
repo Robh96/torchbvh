@@ -28,6 +28,7 @@ from ._mls import (
     BatchedBVHQuery,
     bvh_mls_interpolate,
     bvh_mls_interpolate_batched,
+    bvh_mls_interpolate_batched_heads,
     mls_interpolate,
 )
 from ._multihead import (
@@ -74,6 +75,7 @@ __all__ = [
     "build_bvh_ragged",
     "bvh_mls_interpolate",
     "bvh_mls_interpolate_batched",
+    "bvh_mls_interpolate_batched_heads",
     "mls_interpolate",
     "destroy_bvh",
     "fps",

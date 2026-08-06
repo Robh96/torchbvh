@@ -547,59 +547,108 @@ def bvh_mls_interpolate_batched(
     return result
 
 
-def _bvh_mls_interpolate_batched_head_banked(
+def bvh_mls_interpolate_batched_heads(
     points: torch.Tensor,
-    displaced_by_head: torch.Tensor,
-    features_by_head: torch.Tensor,
+    displaced_points: torch.Tensor,
+    features: torch.Tensor,
     k: int = 8,
     *,
     return_grad: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Private packed-head MLS path for block benchmarks.
+    """Batched matching-head local-linear MLS interpolation.
 
-    ``points`` is shared across heads, while ``displaced_by_head`` and
-    ``features_by_head`` carry head-specific query positions and feature banks.
-    BVH construction and k-NN traversal run once per batch sample over all head
-    queries.
+    Args:
+        points: Shared source positions with shape ``(B, N, D)``.
+        displaced_points: Head-specific queries with shape ``(B, M, H, D)``.
+        features: Head-specific source features with shape
+            ``(B, N, H, C_head)``.
+        k: Number of nearest neighbours.
+        return_grad: Also return the spatial field gradient when true.
+
+    Returns:
+        Interpolated features with shape ``(B, M, H, C_head)``.
+
+        When ``return_grad=True``, also returns the spatial field gradient
+        with shape ``(B, M, H, D, C_head)``.
+
+    BVH construction and neighbour selection are detached. Gradients flow
+    through the MLS solve to ``displaced_points`` and ``features``.
     """
     if points.dim() != 3:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: points must have shape (B, N, D)")
-    if displaced_by_head.dim() != 4:
         raise ValueError(
-            "_bvh_mls_interpolate_batched_head_banked: displaced_by_head must have shape (B, H, M, D)"
+            "bvh_mls_interpolate_batched_heads: "
+            "points must have shape (B, N, D)"
         )
-    if features_by_head.dim() != 4:
+    if displaced_points.dim() != 4:
         raise ValueError(
-            "_bvh_mls_interpolate_batched_head_banked: features_by_head must have shape (B, N, H, C_head)"
+            "bvh_mls_interpolate_batched_heads: "
+            "displaced_points must have shape (B, M, H, D)"
         )
+    if features.dim() != 4:
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: "
+            "features must have shape (B, N, H, C_head)"
+        )
+
     B, N, D = points.shape
-    Bq, H, M, Dq = displaced_by_head.shape
-    Bf, Nf, Hf, _C_head = features_by_head.shape
-    _validate_supported_k("_bvh_mls_interpolate_batched_head_banked", k)
+    Bq, M, H, Dq = displaced_points.shape
+    Bf, Nf, Hf, _ = features.shape
+
+    _validate_supported_k("bvh_mls_interpolate_batched_heads", k)
+
     if D not in SUPPORTED_DIMS:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: D must be 2 or 3")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: D must be 2 or 3"
+        )
     if Bq != B or Bf != B:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: batch dimensions must match")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: batch dimensions must match"
+        )
     if Dq != D:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: displaced last dimension must match points")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: query dimension must match points"
+        )
     if Nf != N:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: features must match points")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: features must match points"
+        )
     if Hf != H:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: feature heads must match displaced heads")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: feature and query heads must match"
+        )
     if N < k:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: points must contain at least k rows per sample")
-    if points.device != displaced_by_head.device or points.device != features_by_head.device:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: inputs must be on the same device")
-    if points.dtype != torch.float32 or displaced_by_head.dtype != torch.float32:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: points and displaced_by_head must be float32")
-    if features_by_head.dtype != torch.float32:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: features_by_head must be float32")
-    if not points.is_cuda or not displaced_by_head.is_cuda or not features_by_head.is_cuda:
-        raise ValueError("_bvh_mls_interpolate_batched_head_banked: inputs must be CUDA tensors")
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: "
+            "points must contain at least k rows"
+        )
+    if (
+        points.device != displaced_points.device
+        or points.device != features.device
+    ):
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: inputs must share a device"
+        )
+    if (
+        points.dtype != torch.float32
+        or displaced_points.dtype != torch.float32
+        or features.dtype != torch.float32
+    ):
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: inputs must be float32"
+        )
+    if not points.is_cuda or not displaced_points.is_cuda or not features.is_cuda:
+        raise ValueError(
+            "bvh_mls_interpolate_batched_heads: inputs must be CUDA tensors"
+        )
 
     points = _as_contiguous(points)
-    displaced_by_head = _as_contiguous(displaced_by_head)
-    features_by_head = _as_contiguous(features_by_head)
+    displaced_points = _as_contiguous(displaced_points)
+    features = _as_contiguous(features)
+
+    displaced_by_head = (
+        displaced_points.permute(0, 2, 1, 3).contiguous()
+    )
+
     points_detached = points.detach().contiguous()
     query = displaced_by_head.detach().reshape(B, H * M, D).contiguous()
 
@@ -612,18 +661,15 @@ def _bvh_mls_interpolate_batched_head_banked(
             sort_queries=True,
         )
 
-    result = _linear_mls_batched_head_banked_indexed_chunked_fused_forward(
+    return _linear_mls_batched_head_banked_indexed_chunked_fused_forward(
         displaced_by_head,
         neighbor_positions,
         indices,
         squared_distances,
-        features_by_head,
+        features,
         return_grad=return_grad,
         chunk_size=4 * _MLS_FLATTENED_CHUNK_SIZE,
     )
-    if return_grad:
-        return result
-    return result
 
 
 def mls_interpolate(

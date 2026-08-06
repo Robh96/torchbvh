@@ -3,7 +3,6 @@ import torch
 
 import torchbvh
 from torchbvh._mls import (
-    _bvh_mls_interpolate_batched_head_banked,
     _linear_mls_chunk,
     _linear_mls_fused_forward,
 )
@@ -119,29 +118,51 @@ def test_fused_forward_matches_reference_chunk_on_same_neighbors():
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0.25, atol=0.25)
 
 
-def test_private_head_banked_batched_mls_matches_public_per_head_loop():
+@pytest.mark.parametrize("dim,k", [(2, 4), (3, 8)])
+def test_bvh_mls_interpolate_batched_heads_matches_per_head_loop_and_backpropagates(dim, k):
     assert torch.cuda.is_available()
     torch.manual_seed(314)
-    B, N, H, M, D, C_head = 2, 32, 3, 9, 3, 4
-    points = torch.randn((B, N, D), device="cuda", dtype=torch.float32).contiguous()
-    displaced_by_head = (
-        points[:, :M, :].unsqueeze(1)
-        + 0.015 * torch.randn((B, H, M, D), device="cuda", dtype=torch.float32)
+    batch_size, num_points, num_queries, num_heads, channels = 2, 32, 9, 3, 4
+    points = torch.randn(
+        (batch_size, num_points, dim), device="cuda", dtype=torch.float32
     ).contiguous()
-    features_by_head = torch.randn((B, N, H, C_head), device="cuda", dtype=torch.float32).contiguous()
+    queries = (
+        points[:, :num_queries, :].unsqueeze(2)
+        + 0.015
+        * torch.randn(
+            (batch_size, num_queries, num_heads, dim),
+            device="cuda",
+            dtype=torch.float32,
+        )
+    ).contiguous().requires_grad_()
+    features = torch.randn(
+        (batch_size, num_points, num_heads, channels),
+        device="cuda",
+        dtype=torch.float32,
+    ).contiguous().requires_grad_()
 
-    packed = _bvh_mls_interpolate_batched_head_banked(points, displaced_by_head, features_by_head, k=8)
-    per_head = torch.stack(
+    expected = torch.stack(
         [
             torchbvh.bvh_mls_interpolate_batched(
                 points,
-                displaced_by_head[:, head, :, :].contiguous(),
-                features_by_head[:, :, head, :].contiguous(),
-                k=8,
+                queries[:, :, head],
+                features[:, :, head],
+                k,
             )
-            for head in range(H)
+            for head in range(num_heads)
         ],
         dim=2,
     )
+    actual = torchbvh.bvh_mls_interpolate_batched_heads(
+        points,
+        queries,
+        features,
+        k,
+    )
 
-    torch.testing.assert_close(packed, per_head, rtol=2.0e-5, atol=2.0e-5)
+    torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-5)
+
+    actual.square().sum().backward()
+
+    assert queries.grad is not None
+    assert features.grad is not None
