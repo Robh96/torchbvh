@@ -78,6 +78,25 @@ Convenience subclass for packed variable-size batches. Equivalent to
 `BVH(points, batch_offsets=batch_offsets)`. It supports `knn(...)` with
 `query_offsets` and lifecycle methods. `interpolate(...)` raises `TypeError`.
 
+### `RayBVH` and `raytrace`
+
+```python
+RayBVH(primitives, *, primitive_type="segment" | "triangle")
+bvh.trace(origins, directions, *, t_min=1e-7, t_max=float("inf"))
+raytrace(primitives, origins, directions, *, primitive_type, t_min=1e-7, t_max=float("inf"))
+```
+
+Segments have shape `(F,2,2)` or `(B,F,2,2)` and triangles have shape
+`(F,3,3)` or `(B,F,3,3)`. Single-BVH rays may have shape `(...,D)`; batched
+rays use `(B,...,D)`. Fixed-size batches build one independent BVH per sample,
+while every token/head ray in that sample traverses the same BVH.
+
+Both calls return `RayHitResult(primitive_indices, t, points, mask)`. Misses use
+index `-1`, `t=inf`, `points=nan`, and `mask=False`. Directions need not be
+normalized. Bounds are scalar and inclusive. Triangles are double-sided.
+`RayBVH` supports `.destroyed`, idempotent `.destroy()`, and context-manager use;
+geometry must not change while its BVH is reused.
+
 ## Handles And Lifecycle
 
 ### `BVHHandle`, `BatchedBVHHandle`, `RaggedBVHHandle`
@@ -291,6 +310,70 @@ bvh_mls_interpolate_batched(points, displaced_points, features, k=8, *, return_g
 
 Backward-compatible fixed-size batched MLS function. Shapes and returns match
 the batched `mls_interpolate(...)` contract.
+
+### `conditional_mls_interpolate`
+
+```python
+conditional_mls_interpolate(
+    mask,
+    *,
+    true_points,
+    true_queries,
+    true_features,
+    false_points,
+    false_queries,
+    false_features,
+    k=4,
+    return_grad=False,
+)
+```
+
+Evaluates exactly one matching-head MLS branch for each query:
+
+```python
+output[b, m, h] = (
+    MLS(true_points, true_queries, true_features)
+    if mask[b, m, h]
+    else MLS(false_points, false_queries, false_features)
+)
+```
+
+Input and output shapes:
+
+- `mask: (B, M, H)` CUDA `bool`.
+- branch points: `(B, N_branch, D)` CUDA `float32`.
+- branch queries: `(B, M, H, D)` CUDA `float32`.
+- branch features: `(B, N_branch, H, C)` CUDA `float32`.
+- output: `(B, M, H, C)`.
+- with `return_grad=True`: output plus spatial field gradient
+  `(B, M, H, D, C)`.
+
+The branches must share `B`, `M`, `H`, `D`, `C`, dtype, and device, but
+`N_true` and `N_false` may differ. Each source count must be at least `k`.
+Inactive query rows are the explicit exception to the finite-input rule: they
+may contain NaNs because `torch.where` excludes them before BVH traversal.
+
+The operation builds two temporary point BVHs, route-sorts the selected queries,
+and performs one exact k-NN traversal and one MLS solve per query. Source
+positions and discrete selection are detached. Gradients flow to selected query
+rows and active source features; inactive query rows and inactive feature rows
+receive zero gradient. `mask` is non-differentiable.
+
+A boundary/field workflow keeps closest-hit ray tracing separate:
+
+```python
+hits = boundary_bvh.trace(origins, displacements, t_max=1.0)
+values = torchbvh.conditional_mls_interpolate(
+    hits.mask,
+    true_points=boundary_pos,
+    true_queries=hits.points,
+    true_features=boundary_features,
+    false_points=field_pos,
+    false_queries=origins + displacements,
+    false_features=field_features,
+    k=4,
+)
+```
 
 ## Displaced-Query Helpers
 

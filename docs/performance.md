@@ -14,8 +14,42 @@ Use the benchmark scripts as measurement tools on your own hardware:
 | --- | --- |
 | `benchmarks/benchmark_knn.py` | single-sample, fixed-size batched, ragged, and displaced-query k-NN paths; optional MLS timing; optional CPU or third-party baselines when their packages are installed |
 | `benchmarks/benchmark_fps.py` | public FPS geometry plus a standalone FPS-warp interpolation proxy at small, 10k-scale, and 50k-scale cases |
+| `benchmarks/benchmark_raytrace.py` | primitive-BVH build, reused closest-hit traversal, and one-shot ray tracing |
+| `benchmarks/benchmark_conditional_mls.py` | two-MLS-plus-`where` baseline versus one-query-per-route conditional MLS, including forward, forward/backward, and peak allocation |
 | `benchmarks/benchmark_flowers_grid_sample.py` | diagnostic comparison between a grid-sample Flower block and the accepted packed-head BVH MLS proxy |
 | `tools/training_step_proxy.py` | small CUDA diagnostic that composes public displaced-query, MLS, and FPS APIs in one proxy step |
+
+Ray tracing should be measured as separate build, reused traversal, and one-shot
+build-plus-traversal timings. Its expected advantage appears once pruning avoids
+enough primitive tests to repay Morton sorting and tree traversal; the crossover
+depends on primitive distribution, ray coherence, `B`, `F`, and ray count. For
+small fields, a dense intersection can remain faster despite worse scaling.
+
+Conditional MLS timings compare equivalent user-visible results. The baseline
+builds/searches both point sets and solves MLS twice for all `R=M*H` queries;
+the conditional path still builds both BVHs but sorts and traverses exactly one
+route and performs one MLS solve per query. Its benefit therefore grows when
+query traversal and MLS dominate the two unavoidable builds. Read
+`baseline_forward_ms` and `conditional_forward_ms` as inference-style timings,
+the `*_forward_backward_ms` fields as training timings, and `*_peak_mib` as
+incremental peak allocated memory for either forward or forward/backward. The maintained script defaults to
+`B=16`, `N_field=M=16000`, `N_boundary=1600`, and `H=40`; reduce `--queries`
+or `--batch` for a smoke run on smaller GPUs.
+
+Local production-shape reference (RTX 3500 Ada, CUDA float32, `k=4`, 20% true
+routes, one channel per head; two timed forward iterations and one
+forward/backward iteration):
+
+| D | Baseline forward | Routed forward | Speedup | Baseline fwd+bwd | Routed fwd+bwd | Speedup | Training peak baseline / routed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 211.7 ms | 113.0 ms | 1.87x | 804.7 ms | 435.6 ms | 1.85x | 3014 / 1608 MiB |
+| 3 | 390.9 ms | 220.0 ms | 1.78x | 1176.2 ms | 652.6 ms | 1.80x | 4031 / 2155 MiB |
+
+Inference-only peak allocation was about 20-22 MiB higher for the routed path
+because it concatenates the two source banks, while the sequential baseline can
+release branch-local search temporaries. During forward/backward, avoiding the
+second saved MLS graph reduced peak allocation by about 1.4 GiB in 2-D and
+1.8 GiB in 3-D. These are reference measurements, not release thresholds.
 
 Optional third-party comparison notebooks and optional baseline flags are useful for experiments, but they are outside routine validation.
 

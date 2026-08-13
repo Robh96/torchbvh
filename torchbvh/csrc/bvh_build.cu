@@ -89,6 +89,62 @@ __global__ void morton_codes_batched_kernel(
     }
 }
 
+template <int D, int V>
+__global__ void primitive_bounds_batched_kernel(
+    const float* __restrict__ primitives,
+    float* __restrict__ centers,
+    float* __restrict__ leaf_aabbs,
+    int64_t total_primitives
+) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_primitives) {
+        return;
+    }
+
+    const float* primitive = primitives + idx * V * D;
+    float* center = centers + idx * D;
+    float* aabb = leaf_aabbs + idx * 2 * D;
+
+    #pragma unroll
+    for (int d = 0; d < D; ++d) {
+        float lo = primitive[d];
+        float hi = primitive[d];
+        float sum = primitive[d];
+        #pragma unroll
+        for (int vertex = 1; vertex < V; ++vertex) {
+            const float value = primitive[vertex * D + d];
+            lo = fminf(lo, value);
+            hi = fmaxf(hi, value);
+            sum += value;
+        }
+        center[d] = sum / static_cast<float>(V);
+        aabb[d] = lo;
+        aabb[D + d] = hi;
+    }
+}
+
+template <int D, int V>
+std::tuple<torch::Tensor, torch::Tensor> primitive_bounds_batched(torch::Tensor primitives) {
+    const int64_t B = primitives.size(0);
+    const int64_t N = primitives.size(1);
+    auto centers = torch::empty({B, N, D}, primitives.options());
+    auto leaf_aabbs = torch::empty({B, N, 2 * D}, primitives.options());
+    const int64_t total = B * N;
+
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    primitive_bounds_batched_kernel<D, V><<<
+        blocks, threads, 0, at::cuda::getCurrentCUDAStream()
+    >>>(
+        primitives.data_ptr<float>(),
+        centers.data_ptr<float>(),
+        leaf_aabbs.data_ptr<float>(),
+        total
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return std::make_tuple(centers, leaf_aabbs);
+}
+
 template <int D>
 __device__ inline void copy_aabb(
     const float* __restrict__ node_aabbs,
@@ -136,6 +192,7 @@ __device__ inline void merge_aabbs(
 template <int D>
 __global__ void build_bvh_kernel(
     const float* __restrict__ points,
+    const float* __restrict__ leaf_aabbs,
     const int64_t* __restrict__ sorted_indices,
     float* __restrict__ node_aabbs,
     int* __restrict__ parent_counters,
@@ -156,9 +213,14 @@ __global__ void build_bvh_kernel(
     float current[2 * D];
     #pragma unroll
     for (int d = 0; d < D; ++d) {
-        const float value = points[original_idx * D + d];
-        current[d] = value;
-        current[D + d] = value;
+        if (leaf_aabbs != nullptr) {
+            current[d] = leaf_aabbs[original_idx * 2 * D + d];
+            current[D + d] = leaf_aabbs[original_idx * 2 * D + D + d];
+        } else {
+            const float value = points[original_idx * D + d];
+            current[d] = value;
+            current[D + d] = value;
+        }
     }
     store_aabb<D>(node_aabbs, mem_idx, current);
     __threadfence();
@@ -196,6 +258,7 @@ __global__ void build_bvh_kernel(
 template <int D>
 __global__ void build_bvh_batched_kernel(
     const float* __restrict__ points,
+    const float* __restrict__ leaf_aabbs,
     const int64_t* __restrict__ sorted_indices,
     float* __restrict__ node_aabbs,
     int* __restrict__ parent_counters,
@@ -227,9 +290,15 @@ __global__ void build_bvh_batched_kernel(
     float current[2 * D];
     #pragma unroll
     for (int d = 0; d < D; ++d) {
-        const float value = points[batch_points_offset + original_idx * D + d];
-        current[d] = value;
-        current[D + d] = value;
+        if (leaf_aabbs != nullptr) {
+            const int64_t offset = (static_cast<int64_t>(b) * N + original_idx) * 2 * D;
+            current[d] = leaf_aabbs[offset + d];
+            current[D + d] = leaf_aabbs[offset + D + d];
+        } else {
+            const float value = points[batch_points_offset + original_idx * D + d];
+            current[d] = value;
+            current[D + d] = value;
+        }
     }
     store_aabb<D>(sample_aabbs, mem_idx, current);
     __threadfence();
@@ -378,7 +447,14 @@ torch::Tensor compute_morton_codes_batched(
 }
 
 template <int D>
-torch::Tensor build_node_aabbs(torch::Tensor points, torch::Tensor sorted_indices, int t, int nr, int leaf_level) {
+torch::Tensor build_node_aabbs(
+    torch::Tensor points,
+    torch::Tensor sorted_indices,
+    int t,
+    int nr,
+    int leaf_level,
+    const float* leaf_aabbs = nullptr
+) {
     auto node_aabbs = torch::empty({nr, 2 * D}, points.options());
     auto counters = torch::zeros({nr}, points.options().dtype(torch::kInt32));
 
@@ -386,6 +462,7 @@ torch::Tensor build_node_aabbs(torch::Tensor points, torch::Tensor sorted_indice
     const int blocks = static_cast<int>((t + threads - 1) / threads);
     build_bvh_kernel<D><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         points.data_ptr<float>(),
+        leaf_aabbs,
         sorted_indices.data_ptr<int64_t>(),
         node_aabbs.data_ptr<float>(),
         counters.data_ptr<int>(),
@@ -403,7 +480,8 @@ torch::Tensor build_node_aabbs_batched(
     int B,
     int N,
     int nr,
-    int leaf_level
+    int leaf_level,
+    const float* leaf_aabbs = nullptr
 ) {
     auto node_aabbs = torch::empty({B, nr, 2 * D}, points.options());
     auto counters = torch::zeros({B, nr}, points.options().dtype(torch::kInt32));
@@ -413,6 +491,7 @@ torch::Tensor build_node_aabbs_batched(
     const dim3 blocks(x_blocks, B);
     build_bvh_batched_kernel<D><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         points.data_ptr<float>(),
+        leaf_aabbs,
         sorted_indices.data_ptr<int64_t>(),
         node_aabbs.data_ptr<float>(),
         counters.data_ptr<int>(),
@@ -545,6 +624,89 @@ std::tuple<
     // Traversal arrays are identical for all samples (same N); store one copy of shape (nr,).
     const auto skip_opts = points.options().dtype(torch::kInt32);
     auto [left_child_mem, right_child_mem, mem_to_leaf] = build_traversal_data(skip_opts, N, nr, leaf);
+
+    return std::make_tuple(
+        node_aabbs, sorted_indices, scene_min, scene_max,
+        B, N, nr, leaf, lv, dim,
+        left_child_mem, right_child_mem, mem_to_leaf
+    );
+}
+
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor
+> build_primitive_bvh_batched_cuda(torch::Tensor primitives) {
+    TORCH_CHECK(primitives.is_cuda(), "build_primitive_bvh_batched: primitives must be a CUDA tensor");
+    TORCH_CHECK(primitives.is_contiguous(), "build_primitive_bvh_batched: primitives must be contiguous");
+    TORCH_CHECK(primitives.scalar_type() == torch::kFloat32, "build_primitive_bvh_batched: primitives must be float32");
+    TORCH_CHECK(primitives.dim() == 4, "build_primitive_bvh_batched: primitives must have shape (B, F, V, D)");
+    TORCH_CHECK(primitives.size(0) >= 1, "build_primitive_bvh_batched: batch size must be at least 1");
+    TORCH_CHECK(primitives.size(1) >= 1, "build_primitive_bvh_batched: each sample must contain at least one primitive");
+
+    const int vertices = static_cast<int>(primitives.size(2));
+    const int dim = static_cast<int>(primitives.size(3));
+    TORCH_CHECK(
+        (vertices == 2 && dim == 2) || (vertices == 3 && dim == 3),
+        "build_primitive_bvh_batched: expected 2-D segments or 3-D triangles"
+    );
+
+    c10::cuda::CUDAGuard device_guard(primitives.device());
+
+    torch::Tensor centers;
+    torch::Tensor leaf_aabbs;
+    if (dim == 2) {
+        std::tie(centers, leaf_aabbs) = primitive_bounds_batched<2, 2>(primitives);
+    } else {
+        std::tie(centers, leaf_aabbs) = primitive_bounds_batched<3, 3>(primitives);
+    }
+
+    namespace tree = implicit_bvh::tree;
+    const int B = static_cast<int>(primitives.size(0));
+    const int N = static_cast<int>(primitives.size(1));
+    const int leaf = tree::leaf_level(N);
+    const int lv = tree::virtual_leaves(N);
+    const int nr = tree::real_node_count(N);
+
+    const auto lower = leaf_aabbs.slice(2, 0, dim);
+    const auto upper = leaf_aabbs.slice(2, dim, 2 * dim);
+    torch::Tensor scene_min = std::get<0>(lower.min(1)).contiguous();
+    torch::Tensor scene_max = std::get<0>(upper.max(1)).contiguous();
+
+    torch::Tensor codes;
+    if (dim == 2) {
+        codes = compute_morton_codes_batched<2>(centers, scene_min, scene_max);
+    } else {
+        codes = compute_morton_codes_batched<3>(centers, scene_min, scene_max);
+    }
+    const auto sort_result = codes.sort(1, false);
+    torch::Tensor sorted_indices = std::get<1>(sort_result).contiguous();
+
+    torch::Tensor node_aabbs;
+    if (dim == 2) {
+        node_aabbs = build_node_aabbs_batched<2>(
+            centers, sorted_indices, B, N, nr, leaf, leaf_aabbs.data_ptr<float>()
+        );
+    } else {
+        node_aabbs = build_node_aabbs_batched<3>(
+            centers, sorted_indices, B, N, nr, leaf, leaf_aabbs.data_ptr<float>()
+        );
+    }
+
+    const auto traversal_options = primitives.options().dtype(torch::kInt32);
+    auto [left_child_mem, right_child_mem, mem_to_leaf] = build_traversal_data(
+        traversal_options, N, nr, leaf
+    );
 
     return std::make_tuple(
         node_aabbs, sorted_indices, scene_min, scene_max,

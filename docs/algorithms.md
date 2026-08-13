@@ -43,6 +43,26 @@ For fixed-size batches, each sample is searched independently and indices are lo
 
 Why it is fast: Brute-force k-NN evaluates every query against every source point, so its distance-work scales as `M * N`. BVH traversal replaces most of those exact point distance evaluations with cheap AABB lower-bound tests. Once a query has `k` good neighbors, any subtree whose nearest possible point is farther than the current k-th neighbor is skipped entirely. The remaining per-query work is independent, so many queries can run in parallel without CPU-side tree traversal or Python loops.
 
+## Closest-Hit Ray Tracing
+
+Primitive BVHs Morton-sort segment or triangle centers and store the complete
+primitive AABB at each leaf. Internal AABBs use the same implicit topology and
+bottom-up merge as point BVHs. Fixed-size batches build independently in one
+batched CUDA path.
+
+Traversal assigns one CUDA thread to each ray. A robust slab test produces the
+entry parameter for each node, the nearer child is visited first, and nodes
+beyond the current closest hit are pruned. Segment leaves solve the 2-D
+cross-product intersection equations; triangle leaves use double-sided
+Möller–Trumbore. Degenerate and non-unique parallel/collinear/coplanar cases are
+misses. Equal-distance hits select the lowest original primitive index.
+
+For `B` samples, `F` primitives per sample, and `Q` rays per sample, building is
+`O(B F log F)` from Morton sorting and uses `O(B F)` storage. Traversal is
+typically `O(B Q log F)`, with the unavoidable worst case `O(B Q F)`, and uses
+`O(B Q)` output plus a fixed per-thread traversal stack. It never materializes
+an all-pairs `(B,Q,F,...)` tensor.
+
 ## MLS Interpolation
 
 Moving least squares interpolation fits a local linear field around each query position using k-NN neighborhoods.
@@ -65,6 +85,33 @@ Gradients do not flow through BVH construction, Morton sorting, k-NN selection, 
 
 Why it is fast: a dense differentiable interpolation would either compare each query to all source points or build large intermediate tensors for weights and gradients. MLS uses the exact k-NN result to restrict the solve to `k` local samples, then solves only a
 small regularized linear system per query. The discrete geometry search is detached, so autograd tracks the continuous MLS solve for `features` and `displaced_points` without recording the BVH traversal, sorting, or integer neighbor selection.
+
+### Conditional MLS Routing
+
+`conditional_mls_interpolate` avoids computing both MLS branches and selecting
+afterward. For `R = M * H` queries per sample it:
+
+1. Selects the live query coordinates with `torch.where(mask, true, false)`.
+2. Flattens heads into the batched query dimension.
+3. Builds ordinary batched point BVHs for the two detached source geometries.
+4. Morton-encodes each query using the bounds of its selected branch.
+5. Places the route bit above the Morton bits and segmented-sorts the composite
+   key within each batch. This groups branches while retaining spatial locality.
+6. Runs one routed exact k-NN kernel. Each thread chooses one BVH and traverses
+   the shared closer-child-first search. False-branch indices are offset into the
+   concatenated source array.
+7. Gathers from concatenated detached positions and solves the existing fused
+   head-banked MLS once.
+
+There is no prefix scan, CPU synchronization, host-visible dynamic count, or
+Python loop over routes. Route-aware sorting is internal and unconditional.
+The fixed-width composite-key radix ordering is `O(B R)`. With `N_t` and `N_f`
+source points, construction is
+`O(B (N_t log N_t + N_f log N_f))`; typical traversal is
+`O(B R log(max(N_t,N_f)))`, with worst case
+`O(B R max(N_t,N_f))`. The local MLS work is `O(B R k)` for fixed spatial and
+feature dimensions. Storage is `O(B(N_t+N_f) + B R k)`, without an all-pairs
+query/source tensor.
 
 ## FPS
 

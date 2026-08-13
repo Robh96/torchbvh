@@ -2,11 +2,13 @@ from .ops import (
     BVH,
     BatchedBVH,
     RaggedBVH,
+    RayBVH,
     BVHHandle,
     BVHQuery,
     BatchedBVHHandle,
     BatchedBVHQuery,
     FPSResult,
+    RayHitResult,
     RaggedBVHHandle,
     SUPPORTED_K,
     SUPPORTED_DIMS,
@@ -16,6 +18,7 @@ from .ops import (
     bvh_mls_interpolate,
     bvh_mls_interpolate_batched,
     bvh_mls_interpolate_batched_heads,
+    conditional_mls_interpolate,
     mls_interpolate,
     destroy_bvh,
     fps,
@@ -32,6 +35,7 @@ from .ops import (
     query_knn,
     query_knn_batched,
     query_knn_ragged,
+    raytrace,
     smoke_add_one,
 )
 
@@ -40,6 +44,7 @@ __all__ = [
     "BVH",
     "BatchedBVH",
     "RaggedBVH",
+    "RayBVH",
     # Stable foundation classes.
     "BVHHandle",
     "BVHQuery",
@@ -47,6 +52,7 @@ __all__ = [
     "BatchedBVHQuery",
     "RaggedBVHHandle",
     "FPSResult",
+    "RayHitResult",
     # Stable foundation functions.
     "build_bvh",
     "build_bvh_batched",
@@ -54,6 +60,7 @@ __all__ = [
     "bvh_mls_interpolate",
     "bvh_mls_interpolate_batched",
     "bvh_mls_interpolate_batched_heads",
+    "conditional_mls_interpolate",
     "mls_interpolate",
     "destroy_bvh",
     "fps",
@@ -63,6 +70,7 @@ __all__ = [
     "query_knn",
     "query_knn_batched",
     "query_knn_ragged",
+    "raytrace",
     # Public constants.
     "SUPPORTED_K",
     "SUPPORTED_DIMS",

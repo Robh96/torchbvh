@@ -72,6 +72,7 @@ setup(
                 "torchbvh/csrc/knn_query.cu",
                 "torchbvh/csrc/mls_fused.cu",
                 "torchbvh/csrc/morton_sort.cu",
+                "torchbvh/csrc/ray_query.cu",
                 "torchbvh/csrc/smoke.cu",
             ],
             include_dirs=["torchbvh/csrc"],

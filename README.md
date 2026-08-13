@@ -1,7 +1,7 @@
 # torchbvh
 
-GPU-native geometry primitives for PyTorch point-cloud workflows: BVH construction,
-exact k-NN search, MLS interpolation, displaced-query helpers, and FPS downsampling.
+GPU-native geometry primitives for PyTorch workflows: BVH construction, exact k-NN
+search, closest-hit ray tracing, MLS interpolation, displaced-query helpers, and FPS.
 
 ## Performance
 
@@ -58,10 +58,32 @@ out = bvh.interpolate(points, feat, k=8)  # (N, 16)
 fps = tb.fps(points, target_tokens=256)
 # fps.indices, fps.points, fps.nearest_anchor, fps.anchor_radius, ...
 
+# Exact closest-hit rays: 2-D segments or 3-D triangles
+segments = torch.randn(2, 128, 2, 2, device="cuda")  # (B, F, 2, 2)
+origins = torch.randn(2, 1024, 4, 2, device="cuda")   # (B, N, H, 2)
+directions = torch.randn_like(origins)
+hits = tb.raytrace(segments, origins, directions,
+                   primitive_type="segment", t_max=1.0)
+# hits.primitive_indices (B,N,H), hits.t, hits.points, hits.mask
+
+# Route each ray to exactly one MLS source field.
+endpoints = origins + directions
+sampled = tb.conditional_mls_interpolate(
+    hits.mask,
+    true_points=boundary_pos,
+    true_queries=hits.points,
+    true_features=boundary_features,
+    false_points=field_pos,
+    false_queries=endpoints,
+    false_features=field_features,
+    k=4,
+)
+# sampled: (B,N,H,C); miss rays use the field branch
+
 # Batched: pass (B, N, D) → returns (B, N, k)
 ```
 
-Supports `D in {2, 3}`, `k in {4, 8, 16}`, CUDA float32 contiguous inputs.
+Supports `D in {2, 3}`, `k in {4, 8, 16}`, and CUDA float32 inputs.
 
 
 ## References

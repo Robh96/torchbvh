@@ -34,6 +34,34 @@ std::tuple<
     torch::Tensor,
     torch::Tensor
 > build_bvh_batched_cuda(torch::Tensor points);
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor
+> build_primitive_bvh_batched_cuda(torch::Tensor primitives);
+std::tuple<torch::Tensor, torch::Tensor> raytrace_batched_cuda(
+    torch::Tensor node_aabbs,
+    torch::Tensor sorted_indices,
+    torch::Tensor left_child_mem,
+    torch::Tensor right_child_mem,
+    torch::Tensor mem_to_leaf,
+    torch::Tensor primitives,
+    torch::Tensor origins,
+    torch::Tensor directions,
+    int num_real_nodes,
+    double t_min,
+    double t_max
+);
 std::tuple<torch::Tensor, torch::Tensor> query_knn_cuda(
     torch::Tensor node_aabbs,
     torch::Tensor sorted_indices,
@@ -74,6 +102,23 @@ std::tuple<torch::Tensor, torch::Tensor> query_knn_batched_ordered_cuda(
     int dim,
     int k
 );
+std::tuple<torch::Tensor, torch::Tensor> query_knn_routed_batched_ordered_cuda(
+    torch::Tensor true_node_aabbs,
+    torch::Tensor true_sorted_indices,
+    torch::Tensor false_node_aabbs,
+    torch::Tensor false_sorted_indices,
+    torch::Tensor query_points,
+    torch::Tensor routes,
+    torch::Tensor query_order,
+    int true_num_leaves,
+    int true_num_real_nodes,
+    int true_leaf_level,
+    int false_num_leaves,
+    int false_num_real_nodes,
+    int false_leaf_level,
+    int dim,
+    int k
+);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mls_fused_forward_cuda(
     torch::Tensor displaced_points,
     torch::Tensor neighbor_positions,
@@ -89,6 +134,14 @@ std::tuple<torch::Tensor, torch::Tensor> morton_sort_queries_batched_cuda(
     torch::Tensor queries,
     torch::Tensor scene_min,
     torch::Tensor scene_max
+);
+torch::Tensor morton_sort_routed_queries_batched_cuda(
+    torch::Tensor queries,
+    torch::Tensor routes,
+    torch::Tensor true_scene_min,
+    torch::Tensor true_scene_max,
+    torch::Tensor false_scene_min,
+    torch::Tensor false_scene_max
 );
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_exact_full_scan_cuda(
     torch::Tensor points,
@@ -214,6 +267,45 @@ pybind11::dict build_bvh_batched(torch::Tensor points) {
     return out;
 }
 
+pybind11::dict build_primitive_bvh_batched(torch::Tensor primitives) {
+    auto result = build_primitive_bvh_batched_cuda(primitives);
+
+    pybind11::dict out;
+    out["node_aabbs"] = std::get<0>(result);
+    out["sorted_indices"] = std::get<1>(result);
+    out["scene_min"] = std::get<2>(result);
+    out["scene_max"] = std::get<3>(result);
+    out["batch_size"] = std::get<4>(result);
+    out["num_leaves"] = std::get<5>(result);
+    out["num_real_nodes"] = std::get<6>(result);
+    out["leaf_level"] = std::get<7>(result);
+    out["virtual_leaves"] = std::get<8>(result);
+    out["dim"] = std::get<9>(result);
+    out["left_child_mem"] = std::get<10>(result);
+    out["right_child_mem"] = std::get<11>(result);
+    out["mem_to_leaf"] = std::get<12>(result);
+    return out;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> raytrace_batched(
+    torch::Tensor node_aabbs,
+    torch::Tensor sorted_indices,
+    torch::Tensor left_child_mem,
+    torch::Tensor right_child_mem,
+    torch::Tensor mem_to_leaf,
+    torch::Tensor primitives,
+    torch::Tensor origins,
+    torch::Tensor directions,
+    int num_real_nodes,
+    double t_min,
+    double t_max
+) {
+    return raytrace_batched_cuda(
+        node_aabbs, sorted_indices, left_child_mem, right_child_mem, mem_to_leaf,
+        primitives, origins, directions, num_real_nodes, t_min, t_max
+    );
+}
+
 std::tuple<torch::Tensor, torch::Tensor> query_knn(
     torch::Tensor node_aabbs,
     torch::Tensor sorted_indices,
@@ -302,6 +394,30 @@ std::tuple<torch::Tensor, torch::Tensor> query_knn_batched_ordered(
     );
 }
 
+std::tuple<torch::Tensor, torch::Tensor> query_knn_routed_batched_ordered(
+    torch::Tensor true_node_aabbs,
+    torch::Tensor true_sorted_indices,
+    torch::Tensor false_node_aabbs,
+    torch::Tensor false_sorted_indices,
+    torch::Tensor query_points,
+    torch::Tensor routes,
+    torch::Tensor query_order,
+    int true_num_leaves,
+    int true_num_real_nodes,
+    int true_leaf_level,
+    int false_num_leaves,
+    int false_num_real_nodes,
+    int false_leaf_level,
+    int dim,
+    int k
+) {
+    return query_knn_routed_batched_ordered_cuda(
+        true_node_aabbs, true_sorted_indices, false_node_aabbs, false_sorted_indices,
+        query_points, routes, query_order,
+        true_num_leaves, true_num_real_nodes, true_leaf_level,
+        false_num_leaves, false_num_real_nodes, false_leaf_level, dim, k);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mls_fused_forward(
     torch::Tensor displaced_points,
     torch::Tensor neighbor_positions,
@@ -362,6 +478,19 @@ std::tuple<torch::Tensor, torch::Tensor> morton_sort_queries_batched(
     torch::Tensor scene_max
 ) {
     return morton_sort_queries_batched_cuda(queries, scene_min, scene_max);
+}
+
+torch::Tensor morton_sort_routed_queries_batched(
+    torch::Tensor queries,
+    torch::Tensor routes,
+    torch::Tensor true_scene_min,
+    torch::Tensor true_scene_max,
+    torch::Tensor false_scene_min,
+    torch::Tensor false_scene_max
+) {
+    return morton_sort_routed_queries_batched_cuda(
+        queries, routes, true_scene_min, true_scene_max,
+        false_scene_min, false_scene_max);
 }
 
 
@@ -596,6 +725,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_bvh_batched", &build_bvh_batched, "Milestone 13 fixed-size batched BVH build");
     m.def("query_knn_batched", &query_knn_batched, "Milestone 13 fixed-size batched exact BVH k-NN query");
     m.def("query_knn_batched_ordered", &query_knn_batched_ordered, "Fixed-size batched exact BVH k-NN query using sorted query order");
+    m.def("query_knn_routed_batched_ordered", &query_knn_routed_batched_ordered,
+          "Private routed fixed-size batched exact BVH k-NN query");
+    m.def("build_primitive_bvh_batched", &build_primitive_bvh_batched, "Build fixed-size batched primitive BVHs");
+    m.def(
+        "raytrace_batched",
+        &raytrace_batched,
+        "Exact closest-hit traversal for batched segments or triangles",
+        py::arg("node_aabbs"),
+        py::arg("sorted_indices"),
+        py::arg("left_child_mem"),
+        py::arg("right_child_mem"),
+        py::arg("mem_to_leaf"),
+        py::arg("primitives"),
+        py::arg("origins"),
+        py::arg("directions"),
+        py::arg("num_real_nodes"),
+        py::arg("t_min"),
+        py::arg("t_max")
+    );
     m.def("mls_fused_forward", &mls_fused_forward, "Stage 11 private fused MLS forward candidate");
     m.def("mls_fused_backward", &mls_fused_backward, "Stage 11 private fused MLS backward (Submilestone 7E.1)");
     m.def("implicit_tree_summary", &implicit_tree_summary, "Milestone 2 implicit tree arithmetic summary");
@@ -606,6 +754,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("morton_encode_2d", &morton_encode_2d, "Milestone 3 2D Morton encode helper");
     m.def("morton_encode_3d", &morton_encode_3d, "Milestone 3 3D Morton encode helper");
     m.def("morton_sort_queries_batched", &morton_sort_queries_batched, "Candidate G fused Morton sort for batched query reordering");
+    m.def("morton_sort_routed_queries_batched", &morton_sort_routed_queries_batched,
+          "Private route-aware Morton sort for conditional queries");
     m.def("fps_exact_full_scan", &fps_exact_full_scan, "Exact full-scan FPS fallback");
     m.def("fps_metadata", &fps_metadata, "Stage 12 M2.5 private CUDA FPS metadata helper");
     m.def("fps_approx_bucketed", &fps_approx_bucketed,

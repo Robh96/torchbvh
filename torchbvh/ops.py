@@ -44,6 +44,8 @@ from ._query import (
     query_knn_batched,
     query_knn_ragged,
 )
+from ._ray import RayBVH, RayHitResult, raytrace
+from ._conditional import conditional_mls_interpolate
 
 # Test/debug arithmetic wrappers stay separate from stable runtime and prototypes.
 from ._tree import (
@@ -62,6 +64,7 @@ __all__ = [
     "BVH",
     "BatchedBVH",
     "RaggedBVH",
+    "RayBVH",
     # Stable foundation classes.
     "BVHHandle",
     "BVHQuery",
@@ -69,6 +72,7 @@ __all__ = [
     "BatchedBVHQuery",
     "RaggedBVHHandle",
     "FPSResult",
+    "RayHitResult",
     # Stable foundation functions.
     "build_bvh",
     "build_bvh_batched",
@@ -76,6 +80,7 @@ __all__ = [
     "bvh_mls_interpolate",
     "bvh_mls_interpolate_batched",
     "bvh_mls_interpolate_batched_heads",
+    "conditional_mls_interpolate",
     "mls_interpolate",
     "destroy_bvh",
     "fps",
@@ -85,6 +90,7 @@ __all__ = [
     "query_knn",
     "query_knn_batched",
     "query_knn_ragged",
+    "raytrace",
     # Test/debug arithmetic wrappers.
     "implicit_tree_ancestor",
     "implicit_tree_descendant",

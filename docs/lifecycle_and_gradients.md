@@ -8,6 +8,10 @@ called out below.
 Users must provide finite input tensors. The package does not promise a
 `torch.isfinite` scan or defined behavior for NaN/Inf values.
 
+`conditional_mls_interpolate` has one narrow exception: query rows inactive
+under its boolean mask may contain NaNs. The live selected query is formed
+before traversal, so inactive rows are never encoded, searched, or solved.
+
 ## Handle Lifetime
 
 Prefer `BVH` for new code. It owns the underlying handle, dispatches across
@@ -22,6 +26,10 @@ with tb.BVH(points) as bvh:
 `BVH`, `BatchedBVH`, and `RaggedBVH` support `.destroyed`, `.destroy()`, and
 context-manager use. Leaving a `with` block calls `.destroy()`. Calling
 `.destroy()` more than once is safe.
+
+`RayBVH` has the same lifecycle contract but owns a primitive BVH rather than a
+point BVH. Its geometry is immutable for the handle lifetime; rebuild after an
+optimizer update or any in-place geometry change.
 
 Procedural code can use handles directly:
 
@@ -103,6 +111,13 @@ to:
 
 Gradients do not flow to the source `points` passed to MLS wrappers.
 
+`conditional_mls_interpolate` follows the same boundary for both source point
+sets. `torch.where` routes gradients to the selected query branch, and
+concatenating feature banks routes feature gradients to rows used by the active
+branch. Inactive query rows and inactive feature-bank rows receive zero
+gradient. The mask, source positions, route/Morton ordering, neighbor indices,
+and squared distances are non-differentiable.
+
 `return_grad=True` returns `(interpolated, field_gradient)`. The
 `field_gradient` tensor is the spatial derivative of the interpolated field. It
 is ordinary operator output, not PyTorch autograd metadata, and enabling it does
@@ -120,6 +135,13 @@ gathered with ordinary PyTorch indexing over already-selected integer indices.
 That gather can propagate gradients to the explicit `source_points` tensor only.
 It is not a gradient through BVH construction, traversal, query coordinates, or
 neighbor selection.
+
+Ray tracing similarly detaches BVH construction and the winning primitive ID.
+After traversal, it gathers the selected live primitive and recomputes the
+analytic intersection parameter in PyTorch. `RayHitResult.t` and `.points`
+therefore propagate piecewise gradients to origins, directions, and the selected
+segment/triangle vertices. Gradients do not cross a hit-selection boundary and
+miss outputs have zero gradients.
 
 ## Where Gradients Do Not Flow
 
