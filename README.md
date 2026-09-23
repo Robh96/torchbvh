@@ -1,11 +1,11 @@
-<h1 align="center"><img src="docs/assets/torchbvh-logo.svg" alt="torchbvh" width="600"></h1>
+<h1 align="center"><img src="docs/assets/torchbvh-logo.svg" alt="torchbvh" width="800"></h1>
 
 **GPU geometry for PyTorch point clouds.** Fast k-NN, farthest-point sampling, interpolation, and ray tracing.
 
-[![PyPI version](https://img.shields.io/pypi/v/torchbvh?label=PyPI&color=17a398)](https://pypi.org/project/torchbvh/)
-[![Python versions](https://img.shields.io/pypi/pyversions/torchbvh?color=17a398)](https://pypi.org/project/torchbvh/)
-[![Documentation](https://img.shields.io/readthedocs/torchbvh/latest?label=docs&color=17a398)](https://torchbvh.readthedocs.io/en/latest/)
-[![License](https://img.shields.io/pypi/l/torchbvh?color=17a398)](LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/torchbvh?label=PyPI&color=3855A5)](https://pypi.org/project/torchbvh/)
+[![Python versions](https://img.shields.io/pypi/pyversions/torchbvh?color=3B7DBF)](https://pypi.org/project/torchbvh/)
+[![Documentation](https://img.shields.io/readthedocs/torchbvh/latest?label=docs&color=17A398)](https://torchbvh.readthedocs.io/en/latest/)
+[![License](https://img.shields.io/pypi/l/torchbvh?color=77C043)](LICENSE)
 
 [Documentation](https://torchbvh.readthedocs.io/en/latest/) · [API reference](docs/api_reference.md) · [Benchmarks](examples/third_party_benchmarks.ipynb)
 
@@ -15,7 +15,6 @@
 
 ![Batched 3D benchmark: torchbvh k-NN and FPS compared with third-party libraries; interpolation on a regular grid provides context.](docs/assets/performance_story.svg)
 
-The plot shows batch 16, 3D, and 10k–50k points and queries. Speedups are geometric means over batch sizes 1 and 16, dimensions 2 and 3, and all five point counts. k-NN was also **22x faster** than CuPy KDTree GPU. MLS interpolates scattered points; on regular grids, `grid_sample` is faster. [Explore the full benchmark](examples/third_party_benchmarks.ipynb) · [Download the PNG](docs/assets/performance_story.png)
 
 ## About
 
@@ -35,7 +34,6 @@ python -m pip install --upgrade setuptools wheel
 python -m pip install --no-build-isolation .
 ```
 
-The [published PyPI release](https://pypi.org/project/torchbvh/) may trail this checkout. Install it with `python -m pip install --no-build-isolation --no-binary torchbvh torchbvh`. See the [build guide](docs/testing.md) for platform details.
 
 ## Quickstart
 
