@@ -1,28 +1,41 @@
-# torchbvh
+<h1 align="center"><img src="docs/assets/torchbvh-logo.svg" alt="torchbvh" width="600"></h1>
 
-GPU-native geometry primitives for PyTorch workflows: BVH construction, exact k-NN search, closest-hit ray tracing, MLS interpolation, displaced-query helpers, and FPS.
+**GPU geometry for PyTorch point clouds.** Fast k-NN, farthest-point sampling, interpolation, and ray tracing.
+
+[![PyPI version](https://img.shields.io/pypi/v/torchbvh?label=PyPI&color=17a398)](https://pypi.org/project/torchbvh/)
+[![Python versions](https://img.shields.io/pypi/pyversions/torchbvh?color=17a398)](https://pypi.org/project/torchbvh/)
+[![Documentation](https://img.shields.io/readthedocs/torchbvh/latest?label=docs&color=17a398)](https://torchbvh.readthedocs.io/en/latest/)
+[![License](https://img.shields.io/pypi/l/torchbvh?color=17a398)](LICENSE)
+
+[Documentation](https://torchbvh.readthedocs.io/en/latest/) · [API reference](docs/api_reference.md) · [Benchmarks](examples/third_party_benchmarks.ipynb)
 
 ## Performance
 
-The production routes use cooperative BVH construction, cached-bound k-NN, indexed packed MLS, bucketed FPS, and cached segment/triangle ray traversal.
-Maintained benchmark commands are documented in [Performance](https://torchbvh.readthedocs.io/en/latest/performance/).
+**20x faster k-NN** than `torch_cluster` GPU and **9.2x faster approximate FPS** than `fpsample` CPU, averaged across all 20 benchmark workloads.
 
+![Batched 3D benchmark: torchbvh k-NN and FPS compared with third-party libraries; interpolation on a regular grid provides context.](docs/assets/performance_story.svg)
 
-## Install
+The plot shows batch 16, 3D, and 10k–50k points and queries. Speedups are geometric means over batch sizes 1 and 16, dimensions 2 and 3, and all five point counts. k-NN was also **22x faster** than CuPy KDTree GPU. MLS interpolates scattered points; on regular grids, `grid_sample` is faster. [Explore the full benchmark](examples/third_party_benchmarks.ipynb) · [Download the PNG](docs/assets/performance_story.png)
 
-Install CUDA-enabled PyTorch for your GPU, the matching CUDA toolkit (including NVCC), and a host C++ compiler supported by that toolkit. Then build `torchbvh` against the PyTorch already installed in your environment:
+## About
+
+`torchbvh` provides CUDA operations for 2D and 3D float32 point clouds, including fixed-size batches:
+
+- **k-NN:** BVH-accelerated nearest-neighbor search.
+- **FPS:** exact and bucketed approximate farthest-point sampling.
+- **Interpolation:** moving least squares (MLS) over scattered point features.
+- **Ray tracing:** segment and triangle intersections.
+
+## Installation
+
+Install CUDA-enabled PyTorch, a matching CUDA toolkit with NVCC, and a supported C++ compiler. To use the current code in this checkout:
 
 ```bash
 python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation --no-binary torchbvh torchbvh
+python -m pip install --no-build-isolation .
 ```
 
-`torchbvh` is **CUDA-only**. Version 0.3.0 is distributed as source rather than as a GPU-specific wheel. By default, PyTorch compiles for the GPUs visible during the build; set `TORCH_CUDA_ARCH_LIST` before installation when building for a different or broader set of GPU architectures.
-See the [testing and build guide](docs/testing.md) for checks and compiler notes.
-
-## Docs
-
-Documentation can be found at [torchbvh.readthedocs.io](https://torchbvh.readthedocs.io/).
+The [published PyPI release](https://pypi.org/project/torchbvh/) may trail this checkout. Install it with `python -m pip install --no-build-isolation --no-binary torchbvh torchbvh`. See the [build guide](docs/testing.md) for platform details.
 
 ## Quickstart
 
@@ -30,61 +43,19 @@ Documentation can be found at [torchbvh.readthedocs.io](https://torchbvh.readthe
 import torch
 import torchbvh as tb
 
-points = torch.randn(128, 3, device="cuda")
-features = torch.randn(128, 8, device="cuda", requires_grad=True)
+points = torch.rand(10_000, 3, device="cuda")
+queries = torch.rand_like(points)
 
-# A BVH owns its resources; the context manager releases them on exit.
 with tb.BVH(points) as bvh:
-    indices, dist_sq = bvh.knn(points[:16], k=8)  # (16, 8) each
-    values = bvh.interpolate(points[:16], features, k=8)  # (16, 8)
+    neighbors, distances_sq = bvh.knn(queries, k=4)
 
-values.sum().backward()  # MLS gradients flow to features
-
-# Exact farthest-point sampling and assignment metadata.
-samples = tb.fps(points, target_tokens=32)
-samples.points           # (32, 3)
-samples.nearest_anchor   # (128,)
-
-# The same BVH class accepts fixed-size batches.
-batched_points = torch.randn(2, 32, 3, device="cuda")
-with tb.BVH(batched_points) as bvh:
-    batch_indices, batch_dist_sq = bvh.knn(batched_points[:, :8], k=4)
-# Both tensors have shape (2, 8, 4).
+sample = tb.fps(points, target_tokens=2_500, mode="approx_bucketed")
+features = torch.rand(10_000, 64, device="cuda")
+values = tb.mls_interpolate(points, queries, features, k=4)
 ```
 
-Continuing from the imports above, a 2-D segment-ray result can route each
-query to one of two MLS feature fields. Misses use the field branch:
-
-```python
-segments = torch.rand(2, 16, 2, 2, device="cuda")  # (B, F, endpoints, D)
-origins = torch.rand(2, 8, 2, 2, device="cuda")     # (B, M, H, D)
-directions = torch.rand_like(origins) - 0.5
-hits = tb.raytrace(segments, origins, directions,
-                   primitive_type="segment", t_max=1.0)
-
-boundary_pos = segments.reshape(2, 32, 2)
-boundary_features = torch.rand(2, 32, 2, 4, device="cuda")
-field_pos = torch.rand(2, 32, 2, device="cuda")
-field_features = torch.rand(2, 32, 2, 4, device="cuda")
-sampled = tb.conditional_mls_interpolate(
-    hits.mask,
-    true_points=boundary_pos,
-    true_queries=hits.points,
-    true_features=boundary_features,
-    false_points=field_pos,
-    false_queries=origins + directions,
-    false_features=field_features,
-    k=4,
-)
-# sampled has shape (2, 8, 2, 4).
-```
-
-Supports `D in {2, 3}`, `k in {4, 8, 16}`, and CUDA float32 inputs.
-
+See the [examples](docs/examples.md) for exact FPS, ray tracing, and gradients.
 
 ## References
-`torchbvh` builds an implicit bounding volume hierarchy over 2-D or 3-D points.
-The BVH layout follows the ostensibly-implicit tree formulation of Chitalu, Dubach, and Komura, and the Python/CUDA implementation was ported from the Julia `ImplicitBVH.jl` implementation.
 
-- Floyd M. Chitalu, Christophe Dubach, and Taku Komura. "Binary Ostensibly-Implicit Trees for Fast Collision Detection." Computer Graphics Forum, 39(2), 509-521, 2020. DOI: [10.1111/cgf.13948](https://doi.org/10.1111/cgf.13948).
-- `ImplicitBVH.jl`, StellaOrg. Julia implementation of the implicitly indexed BVH formulation from which the `torchbvh` BVH code was ported: [github.com/StellaOrg/ImplicitBVH.jl](https://github.com/StellaOrg/ImplicitBVH.jl).
+The BVH implementation builds on [Chitalu, Dubach, and Komura (2020)](https://doi.org/10.1111/cgf.13948) and [ImplicitBVH.jl](https://github.com/StellaOrg/ImplicitBVH.jl). Released under the [MIT license](LICENSE).

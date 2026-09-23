@@ -24,6 +24,8 @@ python benchmarks/benchmark_raytrace.py --primitive-type triangle --scene miss -
 `benchmark_core.py` records build, k-NN, MLS, exact/approximate FPS, and segment/triangle ray timings through the public API. `benchmark_raytrace.py --compare-general` checks cached triangle outputs against the retained general traversal and reports same-process forward and forward-plus-backward timings. Use identical arguments and hardware when comparing revisions.
 Pass `--use-graph` to time FPS with CUDA graph capture enabled.
 
+The [third-party benchmark notebook](https://github.com/Robh96/torchbvh/blob/public/examples/third_party_benchmarks.ipynb) compares one-shot k-NN, FPS, and interpolation against SciPy, torch-cluster, CuPy, fpsample, torch-fpsample, and PyTorch grid sampling. Select the `ml` Jupyter kernel and run all cells to collect the full production workload matrix. It reports output quality alongside latency because approximate FPS and grid interpolation do not have identical semantics to their torchbvh counterparts.
+
 Benchmark after a warm-up, synchronize CUDA around timed regions, and report the PyTorch/CUDA versions, GPU, shapes, dtype, and command line. Compare output equivalence before comparing timings. Exact FPS should match the independent oracle; approximate FPS should be compared by assignment invariants and quality bounds rather than against a removed diagnostic kernel.
 
 Performance reports and one-off candidate implementations are intentionally not kept in the package tree. Git history is the archive for completed optimization studies. Add a benchmark only when it is expected to remain useful for current production behavior.
