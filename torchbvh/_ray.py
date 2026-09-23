@@ -95,8 +95,8 @@ def _selected_hit_t(
     return output_t, output_points, mask
 
 
-class _SegmentRaytrace(torch.autograd.Function):
-    """Fused closest-hit outputs with first-order selected-segment gradients."""
+class _CachedRaytrace(torch.autograd.Function):
+    """Fused closest-hit outputs with first-order selected-primitive gradients."""
 
     @staticmethod
     def forward(
@@ -112,6 +112,7 @@ class _SegmentRaytrace(torch.autograd.Function):
         num_real_nodes,
         t_min,
         t_max,
+        primitive_type,
     ):
         indices, hit_t, points, mask = _C.raytrace_batched_cached(
             node_aabbs,
@@ -127,6 +128,7 @@ class _SegmentRaytrace(torch.autograd.Function):
             float(t_max),
         )
         ctx.save_for_backward(indices, hit_t, primitives, origins, directions)
+        ctx.primitive_type = primitive_type
         ctx.mark_non_differentiable(indices, mask)
         ctx.set_materialize_grads(False)
         return indices, hit_t, points, mask
@@ -139,7 +141,12 @@ class _SegmentRaytrace(torch.autograd.Function):
         empty = torch.empty(0, device=origins.device, dtype=origins.dtype)
         grad_t = empty if grad_t is None else grad_t.contiguous()
         grad_points = empty if grad_points is None else grad_points.contiguous()
-        primitive_grad, origin_grad, direction_grad = _C.raytrace_segment_backward(
+        backward = (
+            _C.raytrace_segment_backward
+            if ctx.primitive_type == "segment"
+            else _C.raytrace_triangle_backward
+        )
+        primitive_grad, origin_grad, direction_grad = backward(
             indices,
             hit_t,
             primitives,
@@ -160,6 +167,7 @@ class _SegmentRaytrace(torch.autograd.Function):
             primitive_grad if need_primitives else None,
             origin_grad if need_origins else None,
             direction_grad if need_directions else None,
+            None,
             None,
             None,
             None,
@@ -235,43 +243,20 @@ class RayBVH:
             flat_origins = origins.reshape(data["batch_size"], -1, self._dim).contiguous()
             flat_directions = directions.reshape(data["batch_size"], -1, self._dim).contiguous()
 
-        if self._primitive_type == "segment":
-            indices, output_t, points, mask = _SegmentRaytrace.apply(
-                data["node_aabbs"],
-                data["sorted_indices"],
-                data["left_child_mem"],
-                data["right_child_mem"],
-                data["mem_to_leaf"],
-                self._primitives_batched.contiguous(),
-                flat_origins,
-                flat_directions,
-                data["num_real_nodes"],
-                t_min,
-                t_max,
-            )
-        else:
-            primitive_values = self._primitives_batched.detach().contiguous()
-            indices, cuda_t = _C.raytrace_batched(
-                data["node_aabbs"],
-                data["sorted_indices"],
-                data["left_child_mem"],
-                data["right_child_mem"],
-                data["mem_to_leaf"],
-                primitive_values,
-                flat_origins.detach(),
-                flat_directions.detach(),
-                data["num_real_nodes"],
-                t_min,
-                t_max,
-            )
-            output_t, points, mask = _selected_hit_t(
-                self._primitives_batched,
-                flat_origins,
-                flat_directions,
-                indices.detach(),
-                cuda_t.detach(),
-                self._primitive_type,
-            )
+        indices, output_t, points, mask = _CachedRaytrace.apply(
+            data["node_aabbs"],
+            data["sorted_indices"],
+            data["left_child_mem"],
+            data["right_child_mem"],
+            data["mem_to_leaf"],
+            self._primitives_batched.contiguous(),
+            flat_origins,
+            flat_directions,
+            data["num_real_nodes"],
+            t_min,
+            t_max,
+            self._primitive_type,
+        )
 
         return RayHitResult(
             primitive_indices=indices.reshape(result_shape),

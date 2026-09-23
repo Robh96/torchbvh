@@ -8,7 +8,7 @@
 | k-NN | cached child bounds, with ordered/spatial variants where query locality helps |
 | MLS | indexed packed kernels; cooperative channel processing for wide features |
 | FPS | exact bucketed or approximate bucket-queue sampling |
-| Rays | cached segment traversal and general triangle traversal |
+| Rays | cached segment and triangle traversal with fused first-order backward |
 
 From a repository checkout, run the maintained benchmark entry points:
 
@@ -16,9 +16,12 @@ From a repository checkout, run the maintained benchmark entry points:
 python benchmarks/benchmark_core.py --warmup 3 --iterations 10
 python benchmarks/benchmark_conditional_mls.py --help
 python benchmarks/benchmark_raytrace.py --help
+python benchmarks/benchmark_raytrace.py --primitive-type triangle --compare-general
+python benchmarks/benchmark_raytrace.py --primitive-type triangle --scene mesh --compare-general
+python benchmarks/benchmark_raytrace.py --primitive-type triangle --scene miss --compare-general
 ```
 
-`benchmark_core.py` records build, k-NN, MLS, exact/approximate FPS, and segment/triangle ray timings through the public API. Use identical arguments and hardware when comparing revisions.
+`benchmark_core.py` records build, k-NN, MLS, exact/approximate FPS, and segment/triangle ray timings through the public API. `benchmark_raytrace.py --compare-general` checks cached triangle outputs against the retained general traversal and reports same-process forward and forward-plus-backward timings. Use identical arguments and hardware when comparing revisions.
 Pass `--use-graph` to time FPS with CUDA graph capture enabled.
 
 Benchmark after a warm-up, synchronize CUDA around timed regions, and report the PyTorch/CUDA versions, GPU, shapes, dtype, and command line. Compare output equivalence before comparing timings. Exact FPS should match the independent oracle; approximate FPS should be compared by assignment invariants and quality bounds rather than against a removed diagnostic kernel.

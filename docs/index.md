@@ -4,7 +4,7 @@ GPU-native geometry primitives for PyTorch point-cloud workflows. `torchbvh` pro
 
 ## Performance
 
-The production routes use cooperative BVH construction, cached-bound k-NN, indexed packed MLS, bucketed FPS, and specialized segment/general triangle ray traversal. See [Performance](performance.md) for maintained benchmark commands and reporting guidance.
+The production routes use cooperative BVH construction, cached-bound k-NN, indexed packed MLS, bucketed FPS, and cached segment/triangle ray traversal. See [Performance](performance.md) for maintained benchmark commands and reporting guidance.
 
 ## Install
 

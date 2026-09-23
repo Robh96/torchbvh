@@ -70,7 +70,7 @@ batched rays use `(B,...,D)`. Fixed-size batches build one independent BVH per s
 Both calls return `RayHitResult(primitive_indices, t, points, mask)`. Misses use index `-1`, `t=inf`, `points=nan`, and `mask=False`.
 Directions need not be normalized. Bounds are scalar and inclusive. Triangles are double-sided.
 
-The segment implementation fuses closest-hit outputs and uses a native analytic backward. The triangle implementation uses its triangle-specific traversal and PyTorch reconstruction. Both provide first-order gradients; higher-order autograd is not supported.
+Both segment and triangle implementations fuse closest-hit outputs through cached traversal and use a native analytic backward. Both provide first-order gradients; higher-order autograd is not supported.
 
 `RayBVH` supports `.destroyed`, idempotent `.destroy()`, and context-manager use; geometry must not change while its BVH is reused.
 

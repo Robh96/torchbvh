@@ -83,10 +83,10 @@ Gradients do not flow to the source `points` passed to MLS wrappers.
 Direct `query_knn` calls have one accepted asymmetry: when explicit `source_points` are provided, the optional returned `neighbor_positions` are gathered with ordinary PyTorch indexing over already-selected integer indices. That gather can propagate gradients to the explicit `source_points` tensor only.
 It is not a gradient through BVH construction, traversal, query coordinates, or neighbor selection.
 
-Ray tracing similarly detaches BVH construction and the winning primitive ID. The segment path uses a fused native analytic backward; the triangle path gathers the selected live primitive and reconstructs the analytic intersection with PyTorch operations. `RayHitResult.t` and `.points` propagate piecewise gradients to origins, directions, and the selected segment/triangle vertices.
+Ray tracing similarly detaches BVH construction and the winning primitive ID. Segment and triangle paths use cached traversal and a fused native analytic backward. `RayHitResult.t` and `.points` propagate piecewise gradients to origins, directions, and the selected segment/triangle vertices.
 Gradients do not cross a hit-selection boundary and miss outputs have zero gradients.
 
-The fused MLS and segment-ray custom autograd operations support first-order gradients. Higher-order differentiation through their backward formulas is not part of the public contract.
+The fused MLS and ray custom autograd operations support first-order gradients. Higher-order differentiation through their backward formulas is not part of the public contract.
 
 ## Where Gradients Do Not Flow
 

@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import torchbvh
+from torchbvh._ray import _selected_hit_t
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -236,6 +237,102 @@ def test_raytrace_piecewise_triangle_gradients_match_moller_trumbore():
     torch.testing.assert_close(actual[0], ref_triangle.grad)
     torch.testing.assert_close(actual[1], ref_origin.grad)
     torch.testing.assert_close(actual[2], ref_direction.grad)
+
+
+def test_cached_triangle_kernel_matches_general_traversal():
+    torch.manual_seed(8104)
+    primitives = torch.rand((2, 97, 3, 3), device="cuda") * 4 - 2
+    origins = torch.rand((2, 143, 3), device="cuda") * 4 - 2
+    directions = torch.rand((2, 143, 3), device="cuda") * 2 - 1
+    with torchbvh.RayBVH(primitives, primitive_type="triangle") as bvh:
+        data = bvh._data
+        args = (
+            data["node_aabbs"], data["sorted_indices"], data["left_child_mem"],
+            data["right_child_mem"], data["mem_to_leaf"], primitives,
+            origins, directions, data["num_real_nodes"], 1e-7, 3.0,
+        )
+        old_indices, old_t = torchbvh._C.raytrace_batched(*args)
+        indices, hit_t, points, mask = torchbvh._C.raytrace_batched_cached(*args)
+
+    torch.testing.assert_close(indices, old_indices)
+    torch.testing.assert_close(hit_t[mask], old_t[mask], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(points[mask], (origins + hit_t[..., None] * directions)[mask])
+    assert torch.equal(mask, indices >= 0)
+    assert torch.isinf(hit_t[~mask]).all()
+    assert torch.isnan(points[~mask]).all()
+
+
+def test_cached_triangle_single_noncontiguous_and_empty_rays():
+    triangle_storage = torch.zeros((1, 3, 6), device="cuda")
+    triangle_storage[..., ::2] = torch.tensor(
+        [[[-1.0, -1.0, 2.0], [1.0, -1.0, 2.0], [0.0, 1.0, 2.0]]], device="cuda"
+    )
+    primitives = triangle_storage[..., ::2]
+    origins_storage = torch.zeros((2, 6), device="cuda")
+    origins_storage[1, 0] = 3.0
+    origins = origins_storage[:, ::2]
+    directions_storage = torch.zeros((2, 6), device="cuda")
+    directions_storage[:, 4] = 1.0
+    directions = directions_storage[:, ::2]
+    assert not primitives.is_contiguous() and not origins.is_contiguous()
+
+    with torchbvh.RayBVH(primitives, primitive_type="triangle") as bvh:
+        hits = bvh.trace(origins, directions)
+        assert hits.primitive_indices.tolist() == [0, -1]
+        assert hits.t[0].item() == 2.0
+        empty = bvh.trace(origins[:0], directions[:0])
+        assert empty.primitive_indices.shape == (0,)
+        assert empty.points.shape == (0, 3)
+
+
+@pytest.mark.parametrize("use_t,use_points", [(True, False), (False, True), (True, True)])
+def test_cached_triangle_gradients_match_general_selected_equation(use_t, use_points):
+    torch.manual_seed(8105)
+    primitives = torch.tensor(
+        [
+            [[[-1.0, -1.0, 2.0], [1.0, -1.0, 2.2], [0.0, 1.0, 1.9]],
+             [[-1.0, -1.0, 4.0], [1.0, -1.0, 4.1], [0.0, 1.0, 3.8]]],
+            [[[-1.0, -1.0, 3.0], [1.0, -1.0, 2.8], [0.0, 1.0, 3.2]],
+             [[-1.0, -1.0, 5.0], [1.0, -1.0, 5.2], [0.0, 1.0, 4.9]]],
+        ], device="cuda", requires_grad=True,
+    )
+    origins = torch.tensor(
+        [[[0.0, 0.0, 0.0], [0.1, 0.1, 0.0], [3.0, 3.0, 0.0]],
+         [[0.0, 0.0, 0.0], [-0.1, 0.1, 0.0], [3.0, 3.0, 0.0]]],
+        device="cuda", requires_grad=True,
+    )
+    directions = torch.tensor(
+        [[[0.05, 0.01, 1.0], [-0.02, 0.03, 1.0], [0.0, 0.0, 1.0]],
+         [[0.02, -0.04, 1.0], [0.03, 0.01, 1.0], [0.0, 0.0, 1.0]]],
+        device="cuda", requires_grad=True,
+    )
+    t_weights = torch.randn((2, 3), device="cuda")
+    point_weights = torch.randn((2, 3, 3), device="cuda")
+
+    result = torchbvh.raytrace(primitives, origins, directions, primitive_type="triangle")
+    loss = 0
+    if use_t:
+        loss = loss + (result.t[result.mask] * t_weights[result.mask]).sum()
+    if use_points:
+        loss = loss + (result.points[result.mask] * point_weights[result.mask]).sum()
+    loss.backward()
+    actual = (primitives.grad.clone(), origins.grad.clone(), directions.grad.clone())
+
+    ref_primitives = primitives.detach().clone().requires_grad_()
+    ref_origins = origins.detach().clone().requires_grad_()
+    ref_directions = directions.detach().clone().requires_grad_()
+    ref_t, ref_points, ref_mask = _selected_hit_t(
+        ref_primitives, ref_origins, ref_directions,
+        result.primitive_indices.detach(), result.t.detach(), "triangle",
+    )
+    reference_loss = 0
+    if use_t:
+        reference_loss = reference_loss + (ref_t[ref_mask] * t_weights[ref_mask]).sum()
+    if use_points:
+        reference_loss = reference_loss + (ref_points[ref_mask] * point_weights[ref_mask]).sum()
+    reference_loss.backward()
+    for computed, expected in zip(actual, (ref_primitives.grad, ref_origins.grad, ref_directions.grad)):
+        torch.testing.assert_close(computed, expected, rtol=2e-5, atol=2e-5)
 
 
 def test_ray_bvh_lifecycle_noncontiguous_inputs_and_api_exports():

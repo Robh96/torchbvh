@@ -11,6 +11,8 @@ namespace {
 
 constexpr float kIntersectionEpsilon = 8.0f * FLT_EPSILON;
 constexpr int kTraversalStackCapacity = 64;
+// At most one far child is deferred per tree level. The int32 implicit tree
+// has at most 31 levels below the root, so 32 slots cover its traversal depth.
 constexpr int kCachedTraversalStackCapacity = 32;
 
 __device__ inline float device_infinity() {
@@ -527,6 +529,89 @@ __global__ void segment_raytrace_backward_kernel(
     }
 }
 
+__global__ void triangle_raytrace_backward_kernel(
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ hit_t,
+    const float* __restrict__ primitives,
+    const float* __restrict__ origins,
+    const float* __restrict__ directions,
+    const float* __restrict__ grad_t,
+    const float* __restrict__ grad_points,
+    float* __restrict__ grad_primitives,
+    float* __restrict__ grad_origins,
+    float* __restrict__ grad_directions,
+    int query_count,
+    int primitive_count,
+    bool need_primitives,
+    bool need_origins,
+    bool need_directions
+) {
+    const int query = blockIdx.x * blockDim.x + threadIdx.x;
+    const int batch = blockIdx.y;
+    if (query >= query_count) return;
+
+    const int64_t ray_index = static_cast<int64_t>(batch) * query_count + query;
+    const int64_t ray_offset = ray_index * 3;
+    const int64_t primitive_idx = indices[ray_index];
+    if (primitive_idx < 0) {
+        if (need_origins) {
+            #pragma unroll
+            for (int axis = 0; axis < 3; ++axis) grad_origins[ray_offset + axis] = 0.0f;
+        }
+        if (need_directions) {
+            #pragma unroll
+            for (int axis = 0; axis < 3; ++axis) grad_directions[ray_offset + axis] = 0.0f;
+        }
+        return;
+    }
+
+    const int64_t primitive_offset =
+        (static_cast<int64_t>(batch) * primitive_count + primitive_idx) * 9;
+    const float* primitive = primitives + primitive_offset;
+    const float* origin = origins + ray_offset;
+    const float* direction = directions + ray_offset;
+    float edge1[3], edge2[3], normal[3], residual[3], grad_normal[3];
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) {
+        edge1[axis] = primitive[3 + axis] - primitive[axis];
+        edge2[axis] = primitive[6 + axis] - primitive[axis];
+    }
+    cross3(edge1, edge2, normal);
+    const float t = hit_t[ray_index];
+    const float inverse_denominator = 1.0f / dot3(normal, direction);
+    float total_t_grad = grad_t == nullptr ? 0.0f : grad_t[ray_index];
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) {
+        const float point_grad = grad_points == nullptr ? 0.0f : grad_points[ray_offset + axis];
+        total_t_grad += point_grad * direction[axis];
+        residual[axis] = primitive[axis] - origin[axis] - t * direction[axis];
+    }
+    const float scale = total_t_grad * inverse_denominator;
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) grad_normal[axis] = scale * residual[axis];
+
+    if (need_primitives) {
+        float grad_edge1[3], grad_edge2[3];
+        cross3(edge2, grad_normal, grad_edge1);
+        cross3(grad_normal, edge1, grad_edge2);
+        #pragma unroll
+        for (int axis = 0; axis < 3; ++axis) {
+            atomicAdd(grad_primitives + primitive_offset + axis,
+                      scale * normal[axis] - grad_edge1[axis] - grad_edge2[axis]);
+            atomicAdd(grad_primitives + primitive_offset + 3 + axis, grad_edge1[axis]);
+            atomicAdd(grad_primitives + primitive_offset + 6 + axis, grad_edge2[axis]);
+        }
+    }
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) {
+        const float point_grad = grad_points == nullptr ? 0.0f : grad_points[ray_offset + axis];
+        if (need_origins) grad_origins[ray_offset + axis] = point_grad - scale * normal[axis];
+        if (need_directions) grad_directions[ray_offset + axis] =
+            t * (point_grad - scale * normal[axis]);
+    }
+}
+
+template <int D, int V>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 launch_raytrace_batched_cached(
     torch::Tensor node_aabbs,
@@ -546,14 +631,14 @@ launch_raytrace_batched_cached(
     const int F = static_cast<int>(primitives.size(1));
     auto indices = torch::empty({B, Q}, origins.options().dtype(torch::kInt64));
     auto hit_t = torch::empty({B, Q}, origins.options());
-    auto points = torch::empty({B, Q, 2}, origins.options());
+    auto points = torch::empty({B, Q, D}, origins.options());
     auto mask = torch::empty({B, Q}, origins.options().dtype(torch::kBool));
     if (Q == 0) {
         return std::make_tuple(indices, hit_t, points, mask);
     }
     constexpr int threads = 128;
     const dim3 blocks((Q + threads - 1) / threads, B);
-    raytrace_batched_cached_kernel<2, 2><<<
+    raytrace_batched_cached_kernel<D, V><<<
         blocks, threads, 0, at::cuda::getCurrentCUDAStream()
     >>>(
         node_aabbs.data_ptr<float>(), sorted_indices.data_ptr<int64_t>(),
@@ -653,9 +738,12 @@ raytrace_batched_cached_cuda(
     TORCH_CHECK(primitives.scalar_type() == torch::kFloat32 && origins.scalar_type() == torch::kFloat32 && directions.scalar_type() == torch::kFloat32, "raytrace_batched_cached: geometry and rays must be float32");
     TORCH_CHECK(sorted_indices.scalar_type() == torch::kInt64, "raytrace_batched_cached: sorted_indices must be int64");
     TORCH_CHECK(left_child_mem.scalar_type() == torch::kInt32 && right_child_mem.scalar_type() == torch::kInt32 && mem_to_leaf.scalar_type() == torch::kInt32, "raytrace_batched_cached: traversal tensors must be int32");
-    TORCH_CHECK(primitives.dim() == 4 && primitives.size(2) == 2 && primitives.size(3) == 2, "raytrace_batched_cached: expected batched 2-D segments");
-    TORCH_CHECK(origins.dim() == 3 && origins.size(2) == 2 && origins.sizes() == directions.sizes(), "raytrace_batched_cached: rays must have shape (B, Q, 2)");
-    TORCH_CHECK(node_aabbs.dim() == 3 && node_aabbs.size(2) == 4 && sorted_indices.dim() == 2, "raytrace_batched_cached: invalid BVH shapes");
+    TORCH_CHECK(primitives.dim() == 4, "raytrace_batched_cached: primitives must have shape (B, F, V, D)");
+    const int V = static_cast<int>(primitives.size(2));
+    const int D = static_cast<int>(primitives.size(3));
+    TORCH_CHECK((V == 2 && D == 2) || (V == 3 && D == 3), "raytrace_batched_cached: expected 2-D segments or 3-D triangles");
+    TORCH_CHECK(origins.dim() == 3 && origins.size(2) == D && origins.sizes() == directions.sizes(), "raytrace_batched_cached: ray shape must match primitive dimension");
+    TORCH_CHECK(node_aabbs.dim() == 3 && node_aabbs.size(2) == 2 * D && sorted_indices.dim() == 2, "raytrace_batched_cached: invalid BVH shapes");
     TORCH_CHECK(primitives.size(0) == origins.size(0) && node_aabbs.size(0) == origins.size(0) && sorted_indices.size(0) == origins.size(0), "raytrace_batched_cached: batch sizes must match");
     TORCH_CHECK(node_aabbs.size(1) == num_real_nodes, "raytrace_batched_cached: num_real_nodes does not match BVH");
     TORCH_CHECK(left_child_mem.numel() == num_real_nodes && right_child_mem.numel() == num_real_nodes && mem_to_leaf.numel() == num_real_nodes, "raytrace_batched_cached: traversal arrays do not match BVH");
@@ -666,7 +754,14 @@ raytrace_batched_cached_cuda(
     TORCH_CHECK(node_aabbs.device() == origins.device() && sorted_indices.device() == origins.device(), "raytrace_batched_cached: BVH and rays must share a device");
     TORCH_CHECK(left_child_mem.device() == origins.device() && right_child_mem.device() == origins.device() && mem_to_leaf.device() == origins.device(), "raytrace_batched_cached: traversal data and rays must share a device");
     TORCH_CHECK(primitives.device() == origins.device() && directions.device() == origins.device(), "raytrace_batched_cached: geometry and rays must share a device");
-    return launch_raytrace_batched_cached(
+    if (D == 2) {
+        return launch_raytrace_batched_cached<2, 2>(
+            node_aabbs, sorted_indices, left_child_mem, right_child_mem, mem_to_leaf,
+            primitives, origins, directions, num_real_nodes,
+            static_cast<float>(t_min), static_cast<float>(t_max)
+        );
+    }
+    return launch_raytrace_batched_cached<3, 3>(
         node_aabbs, sorted_indices, left_child_mem, right_child_mem, mem_to_leaf,
         primitives, origins, directions, num_real_nodes,
         static_cast<float>(t_min), static_cast<float>(t_max)
@@ -709,6 +804,73 @@ raytrace_segment_backward_cuda(
         constexpr int threads = 128;
         const dim3 blocks((Q + threads - 1) / threads, B);
         segment_raytrace_backward_kernel<<<
+            blocks, threads, 0, at::cuda::getCurrentCUDAStream()
+        >>>(
+            indices.data_ptr<int64_t>(), hit_t.data_ptr<float>(),
+            primitives.data_ptr<float>(), origins.data_ptr<float>(),
+            directions.data_ptr<float>(),
+            grad_t.numel() == 0 ? nullptr : grad_t.data_ptr<float>(),
+            grad_points.numel() == 0 ? nullptr : grad_points.data_ptr<float>(),
+            need_primitives ? grad_primitives.data_ptr<float>() : nullptr,
+            need_origins ? grad_origins.data_ptr<float>() : nullptr,
+            need_directions ? grad_directions.data_ptr<float>() : nullptr,
+            Q, static_cast<int>(primitives.size(1)),
+            need_primitives, need_origins, need_directions
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return std::make_tuple(grad_primitives, grad_origins, grad_directions);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+raytrace_triangle_backward_cuda(
+    torch::Tensor indices,
+    torch::Tensor hit_t,
+    torch::Tensor primitives,
+    torch::Tensor origins,
+    torch::Tensor directions,
+    torch::Tensor grad_t,
+    torch::Tensor grad_points,
+    bool need_primitives,
+    bool need_origins,
+    bool need_directions
+) {
+    const char* op = "raytrace_triangle_backward";
+    TORCH_CHECK(indices.is_cuda() && hit_t.is_cuda() && primitives.is_cuda()
+                && origins.is_cuda() && directions.is_cuda(), op, ": tensors must be CUDA tensors");
+    TORCH_CHECK(indices.is_contiguous() && hit_t.is_contiguous() && primitives.is_contiguous()
+                && origins.is_contiguous() && directions.is_contiguous(), op, ": tensors must be contiguous");
+    TORCH_CHECK(primitives.dim() == 4 && primitives.size(2) == 3 && primitives.size(3) == 3,
+                op, ": primitives must have shape (B, F, 3, 3)");
+    TORCH_CHECK(origins.dim() == 3 && origins.size(2) == 3 && origins.sizes() == directions.sizes(),
+                op, ": rays must have shape (B, Q, 3)");
+    TORCH_CHECK(indices.dim() == 2 && indices.size(0) == origins.size(0)
+                && indices.size(1) == origins.size(1) && hit_t.sizes() == indices.sizes(),
+                op, ": hit tensors must have shape (B, Q)");
+    TORCH_CHECK(primitives.size(0) == origins.size(0), op, ": batch sizes must match");
+    TORCH_CHECK(indices.scalar_type() == torch::kInt64 && hit_t.scalar_type() == torch::kFloat32
+                && primitives.scalar_type() == torch::kFloat32 && origins.scalar_type() == torch::kFloat32
+                && directions.scalar_type() == torch::kFloat32, op, ": expected int64 indices and float32 values");
+    TORCH_CHECK(grad_t.numel() == 0 || (grad_t.is_contiguous() && grad_t.sizes() == indices.sizes()),
+                op, ": grad_t must have shape (B, Q)");
+    TORCH_CHECK(grad_points.numel() == 0 || (grad_points.is_contiguous() && grad_points.sizes() == origins.sizes()),
+                op, ": grad_points must have shape (B, Q, 3)");
+    c10::cuda::CUDAGuard device_guard(origins.device());
+    TORCH_CHECK(indices.device() == origins.device() && hit_t.device() == origins.device()
+                && primitives.device() == origins.device() && directions.device() == origins.device(),
+                op, ": tensors must share a device");
+    auto grad_primitives = need_primitives
+        ? torch::zeros_like(primitives) : torch::empty({0}, primitives.options());
+    auto grad_origins = need_origins
+        ? torch::empty_like(origins) : torch::empty({0}, origins.options());
+    auto grad_directions = need_directions
+        ? torch::empty_like(directions) : torch::empty({0}, directions.options());
+    const int B = static_cast<int>(origins.size(0));
+    const int Q = static_cast<int>(origins.size(1));
+    if (Q > 0 && (need_primitives || need_origins || need_directions)) {
+        constexpr int threads = 128;
+        const dim3 blocks((Q + threads - 1) / threads, B);
+        triangle_raytrace_backward_kernel<<<
             blocks, threads, 0, at::cuda::getCurrentCUDAStream()
         >>>(
             indices.data_ptr<int64_t>(), hit_t.data_ptr<float>(),

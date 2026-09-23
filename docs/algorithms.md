@@ -44,7 +44,7 @@ Why it is fast: Brute-force k-NN evaluates every query against every source poin
 
 Primitive BVHs Morton-sort segment or triangle centers and store the complete primitive AABB at each leaf. Internal AABBs use the same implicit topology and bottom-up merge as point BVHs. Fixed-size batches build independently in one batched CUDA path.
 
-Traversal assigns one CUDA thread to each ray. A robust slab test produces the entry parameter for each node, the nearer child is visited first, and nodes beyond the current closest hit are pruned. 
+Traversal assigns one CUDA thread to each ray. A robust slab test produces the entry parameter for each node. Both 2-D and 3-D paths visit the nearer child first, cache the deferred child's entry parameter on the stack, and prune nodes beyond the current closest hit without repeating their AABB test.
 Segment leaves solve the 2-D cross-product intersection equations; triangle leaves use double-sided Möller–Trumbore. Degenerate and non-unique parallel/collinear/coplanar cases are misses. Equal-distance hits select the lowest original primitive index.
 
 For `B` samples, `F` primitives per sample, and `Q` rays per sample, building is `O(B F log F)` from Morton sorting and uses `O(B F)` storage. 

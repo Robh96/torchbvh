@@ -73,6 +73,12 @@ raytrace_segment_backward_cuda(
     torch::Tensor origins, torch::Tensor directions, torch::Tensor grad_t,
     torch::Tensor grad_points, bool need_primitives, bool need_origins,
     bool need_directions);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+raytrace_triangle_backward_cuda(
+    torch::Tensor indices, torch::Tensor hit_t, torch::Tensor primitives,
+    torch::Tensor origins, torch::Tensor directions, torch::Tensor grad_t,
+    torch::Tensor grad_points, bool need_primitives, bool need_origins,
+    bool need_directions);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 fps_exact_bucketed_lean_cuda(
@@ -131,6 +137,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("raytrace_batched", &raytrace_batched_cuda);
     m.def("raytrace_batched_cached", &raytrace_batched_cached_cuda);
     m.def("raytrace_segment_backward", &raytrace_segment_backward_cuda);
+    m.def("raytrace_triangle_backward", &raytrace_triangle_backward_cuda);
     m.def(
         "fps_exact_bucketed_lean", &fps_exact_bucketed_lean_cuda,
         pybind11::arg("points"), pybind11::arg("seed_indices"),
