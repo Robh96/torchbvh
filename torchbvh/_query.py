@@ -26,6 +26,16 @@ from ._validation import (
 # Private per-variant builders
 # ---------------------------------------------------------------------------
 
+_INT32_MAX = 2**31 - 1
+
+
+def _validate_narrow_build_extent(prefix: str, points: torch.Tensor) -> None:
+    # The production Morton path uses 32-bit CUB values and segment offsets.
+    # Fail explicitly instead of allowing a silent integer wrap in native code.
+    total = int(points.size(0)) if points.dim() == 2 else int(points.size(0)) * int(points.size(1))
+    if total > _INT32_MAX:
+        raise ValueError(f"{prefix}: total point count must fit in signed int32")
+
 def _build_bvh_single(points: torch.Tensor) -> BVHHandle:
     if points.dim() != 2:
         raise ValueError("build_bvh: points must have shape (N, D)")
@@ -33,17 +43,26 @@ def _build_bvh_single(points: torch.Tensor) -> BVHHandle:
         raise ValueError("build_bvh: D must be 2 or 3")
     _validate_cuda_float32("build_bvh", points, "points")
     points = _as_contiguous(points)
-    return BVHHandle(_C.build_bvh(points))
+    _validate_narrow_build_extent("build_bvh", points)
+    data = dict(_C.build_bvh_batched_cooperative(points.unsqueeze(0)))
+    # The native cooperative implementation shares one fixed-size topology
+    # across a batch. Strip that leading batch dimension to preserve the
+    # established single-handle payload exactly.
+    data.pop("batch_size")
+    for key in ("node_aabbs", "sorted_indices", "scene_min", "scene_max"):
+        data[key] = data[key].squeeze(0)
+    return BVHHandle(data)
 
 
 def _build_bvh_batched(points: torch.Tensor) -> BatchedBVHHandle:
     if points.dim() != 3:
-        raise ValueError("build_bvh_batched: points must have shape (B, N, D)")
+        raise ValueError("build_bvh: batched points must have shape (B, N, D)")
     if points.size(2) not in SUPPORTED_DIMS:
-        raise ValueError("build_bvh_batched: D must be 2 or 3")
-    _validate_cuda_float32("build_bvh_batched", points, "points")
+        raise ValueError("build_bvh: D must be 2 or 3")
+    _validate_cuda_float32("build_bvh", points, "points")
     points = _as_contiguous(points)
-    return BatchedBVHHandle(_C.build_bvh_batched(points))
+    _validate_narrow_build_extent("build_bvh", points)
+    return BatchedBVHHandle(_C.build_bvh_batched_cooperative(points))
 
 
 def _build_bvh_ragged(points: torch.Tensor, batch_offsets: torch.Tensor) -> RaggedBVHHandle:
@@ -94,17 +113,12 @@ def build_bvh(
     raise ValueError("build_bvh: points must have shape (N, D) or (B, N, D)")
 
 
-# Backward-compatible per-variant aliases.
-build_bvh_batched = _build_bvh_batched
-build_bvh_ragged = _build_bvh_ragged
-
-
 # ---------------------------------------------------------------------------
 # Private per-variant query functions
 # ---------------------------------------------------------------------------
 
 def _query_knn_single(
-    bvh: BVHHandle | Mapping,
+    bvh: BVHHandle,
     query_points: torch.Tensor,
     k: int,
     *,
@@ -121,35 +135,37 @@ def _query_knn_single(
     if query_points.device != data["sorted_indices"].device:
         raise ValueError("query_knn: query_points must be on the same device as the BVH")
     query_points = _as_contiguous(query_points)
+    batched_queries = query_points.unsqueeze(0)
+    node_aabbs = data["node_aabbs"].unsqueeze(0)
+    sorted_indices = data["sorted_indices"].unsqueeze(0)
     if sort_queries:
-        from ._reorder import morton_sort_queries_batched
-
-        query_batch = query_points.unsqueeze(0)
-        sort_perm, _ = morton_sort_queries_batched(
-            query_batch,
+        sort_perm = _C.morton_sort_queries_narrow(
+            batched_queries,
             data["scene_min"].unsqueeze(0),
             data["scene_max"].unsqueeze(0),
         )
-        indices, squared_distances = _C.query_knn_ordered(
-            data["node_aabbs"],
-            data["sorted_indices"],
-            query_points,
-            sort_perm.squeeze(0).contiguous(),
+        indices, squared_distances = _C.query_knn_batched_cached_bounds_ordered(
+            node_aabbs,
+            sorted_indices,
+            batched_queries,
+            sort_perm.contiguous(),
             data["num_leaves"],
-            data["leaf_level"],
+            data["num_real_nodes"],
             data["dim"],
             k,
         )
     else:
-        indices, squared_distances = _C.query_knn(
-            data["node_aabbs"],
-            data["sorted_indices"],
-            query_points,
+        indices, squared_distances = _C.query_knn_batched_cached_bounds(
+            node_aabbs,
+            sorted_indices,
+            batched_queries,
             data["num_leaves"],
-            data["leaf_level"],
+            data["num_real_nodes"],
             data["dim"],
             k,
         )
+    indices = indices.squeeze(0)
+    squared_distances = squared_distances.squeeze(0)
     if source_points is None:
         return indices, squared_distances
 
@@ -190,13 +206,17 @@ def _gather_batched_neighbor_positions(
     query_count: int,
     dim: int,
 ) -> torch.Tensor:
-    gather_index = indices.unsqueeze(-1).expand(-1, -1, -1, dim)
-    expanded_source = source_points.unsqueeze(1).expand(-1, query_count, -1, -1)
-    return torch.gather(expanded_source, 2, gather_index)
+    batch_size, _, neighbor_count = indices.shape
+    gather_index = indices.reshape(
+        batch_size, query_count * neighbor_count, 1
+    ).expand(-1, -1, dim)
+    return torch.gather(source_points, 1, gather_index).reshape(
+        batch_size, query_count, neighbor_count, dim
+    )
 
 
 def _query_knn_batched(
-    bvh: BatchedBVHHandle | Mapping,
+    bvh: BatchedBVHHandle,
     query_points: torch.Tensor,
     k: int,
     *,
@@ -217,33 +237,29 @@ def _query_knn_batched(
     query_points = _as_contiguous(query_points)
 
     if sort_queries:
-        from ._reorder import morton_sort_queries_batched
-
         query_points = query_points.contiguous()
-        sort_perm, _ = morton_sort_queries_batched(
+        sort_perm = _C.morton_sort_queries_narrow(
             query_points,
             data["scene_min"],
             data["scene_max"],
         )
-        indices, squared_distances = _C.query_knn_batched_ordered(
+        indices, squared_distances = _C.query_knn_batched_cached_bounds_ordered(
             data["node_aabbs"],
             data["sorted_indices"],
             query_points,
             sort_perm.contiguous(),
             data["num_leaves"],
             data["num_real_nodes"],
-            data["leaf_level"],
             data["dim"],
             k,
         )
     else:
-        indices, squared_distances = _C.query_knn_batched(
+        indices, squared_distances = _C.query_knn_batched_cached_bounds(
             data["node_aabbs"],
             data["sorted_indices"],
             query_points,
             data["num_leaves"],
             data["num_real_nodes"],
-            data["leaf_level"],
             data["dim"],
             k,
         )
@@ -355,7 +371,7 @@ def _query_knn_ragged(
 # ---------------------------------------------------------------------------
 
 def query_knn(
-    bvh: BVHHandle | BatchedBVHHandle | RaggedBVHHandle | Mapping,
+    bvh: BVHHandle | BatchedBVHHandle | RaggedBVHHandle,
     query_points: torch.Tensor,
     k: int,
     *,
@@ -378,19 +394,12 @@ def query_knn(
                 "query_knn: query_offsets is required when querying a ragged BVH"
             )
         return _query_knn_ragged(bvh, query_points, query_offsets, k, source_points=source_points)
+    if query_offsets is not None:
+        raise TypeError("query_knn: query_offsets requires a RaggedBVHHandle")
     if isinstance(bvh, BatchedBVHHandle):
-        return _query_knn_batched(
-            bvh, query_points, k, source_points=source_points, sort_queries=sort_queries
-        )
-    if isinstance(bvh, Mapping) and bvh.get("_batched", False):
         return _query_knn_batched(
             bvh, query_points, k, source_points=source_points, sort_queries=sort_queries
         )
     return _query_knn_single(
         bvh, query_points, k, source_points=source_points, sort_queries=sort_queries
     )
-
-
-# Backward-compatible per-variant aliases.
-query_knn_batched = _query_knn_batched
-query_knn_ragged = _query_knn_ragged

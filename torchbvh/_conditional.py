@@ -5,11 +5,8 @@ import torch
 from . import _C
 from ._constants import SUPPORTED_DIMS
 from ._handles import _batched_bvh_data, _temporary_bvh
-from ._mls import (
-    _MLS_FLATTENED_CHUNK_SIZE,
-    _linear_mls_batched_head_banked_indexed_chunked_fused_forward,
-)
-from ._query import build_bvh_batched, _gather_batched_neighbor_positions
+from ._mls import _linear_mls_spatial_indexed
+from ._query import _build_bvh_batched
 from ._validation import _as_contiguous, _validate_supported_k
 
 
@@ -79,43 +76,6 @@ def _validate_inputs(
     return B, M, H, D, C
 
 
-def _query_knn_routed_batched(
-    true_bvh,
-    false_bvh,
-    queries: torch.Tensor,
-    routes: torch.Tensor,
-    k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Private exact routed k-NN over two fixed-size batched point BVHs."""
-    true_data = _batched_bvh_data(true_bvh, _OP)
-    false_data = _batched_bvh_data(false_bvh, _OP)
-    query_order = _C.morton_sort_routed_queries_batched(
-        queries,
-        routes,
-        true_data["scene_min"],
-        true_data["scene_max"],
-        false_data["scene_min"],
-        false_data["scene_max"],
-    )
-    return _C.query_knn_routed_batched_ordered(
-        true_data["node_aabbs"],
-        true_data["sorted_indices"],
-        false_data["node_aabbs"],
-        false_data["sorted_indices"],
-        queries,
-        routes,
-        query_order.contiguous(),
-        true_data["num_leaves"],
-        true_data["num_real_nodes"],
-        true_data["leaf_level"],
-        false_data["num_leaves"],
-        false_data["num_real_nodes"],
-        false_data["leaf_level"],
-        true_data["dim"],
-        k,
-    )
-
-
 def conditional_mls_interpolate(
     mask: torch.Tensor,
     *,
@@ -173,24 +133,64 @@ def conditional_mls_interpolate(
     true_points_detached = true_points.detach().contiguous()
     false_points_detached = false_points.detach().contiguous()
 
-    with _temporary_bvh(build_bvh_batched, true_points_detached) as true_bvh:
-        with _temporary_bvh(build_bvh_batched, false_points_detached) as false_bvh:
-            indices, squared_distances = _query_knn_routed_batched(
-                true_bvh, false_bvh, flat_queries, flat_routes, k)
+    with _temporary_bvh(_build_bvh_batched, true_points_detached) as true_bvh:
+        with _temporary_bvh(_build_bvh_batched, false_points_detached) as false_bvh:
+            true_data = _batched_bvh_data(true_bvh, _OP)
+            false_data = _batched_bvh_data(false_bvh, _OP)
+            query_order = _C.morton_sort_routed_queries_batched(
+                flat_queries,
+                flat_routes,
+                true_data["scene_min"],
+                true_data["scene_max"],
+                false_data["scene_min"],
+                false_data["scene_max"],
+            ).contiguous()
+            indices, squared_distances = (
+                _C.query_knn_routed_batched_cached_bounds_spatial(
+                    true_data["node_aabbs"],
+                    true_data["sorted_indices"],
+                    false_data["node_aabbs"],
+                    false_data["sorted_indices"],
+                    flat_queries,
+                    flat_routes,
+                    query_order,
+                    true_data["num_leaves"],
+                    true_data["num_real_nodes"],
+                    false_data["num_leaves"],
+                    false_data["num_real_nodes"],
+                    D,
+                    k,
+                )
+            )
 
-    combined_points = torch.cat((true_points_detached, false_points_detached), dim=1)
-    neighbor_positions = _gather_batched_neighbor_positions(
-        combined_points, indices, H * M, D)
+    combined_points = torch.cat(
+        (true_points_detached, false_points_detached), dim=1
+    ).contiguous()
     combined_features = torch.cat((true_features, false_features), dim=1)
-    return _linear_mls_batched_head_banked_indexed_chunked_fused_forward(
-        selected_by_head,
-        neighbor_positions,
-        indices,
-        squared_distances,
-        combined_features,
+    source_count = combined_points.size(1)
+    channels = combined_features.size(-1)
+    feature_bank = combined_features.permute(0, 2, 1, 3).reshape(
+        B * H, source_count, channels
+    ).contiguous()
+    result = _linear_mls_spatial_indexed(
+        selected_by_head.reshape(B * H * M, D),
+        combined_points,
+        indices.reshape(B * H * M, k),
+        squared_distances.reshape(B * H * M, k),
+        feature_bank,
+        query_order.reshape(B * H * M),
+        queries_per_batch=H * M,
+        queries_per_head=M,
         return_grad=return_grad,
-        chunk_size=4 * _MLS_FLATTENED_CHUNK_SIZE,
     )
+    if return_grad:
+        values, gradient = result
+        return (
+            values.reshape(B, H, M, channels).permute(0, 2, 1, 3).contiguous(),
+            gradient.reshape(B, H, M, D, channels)
+            .permute(0, 2, 1, 3, 4).contiguous(),
+        )
+    return result.reshape(B, H, M, channels).permute(0, 2, 1, 3).contiguous()
 
 
 __all__ = ["conditional_mls_interpolate"]

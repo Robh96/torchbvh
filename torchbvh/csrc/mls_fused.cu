@@ -7,6 +7,359 @@
 #include <cmath>
 #include <tuple>
 
+// Production indexed MLS kernels: packed for narrow features and cooperative
+// for wide features. Only Indexed=true specializations are instantiated.
+
+template <int D>
+__device__ __forceinline__ float packed_basis_value(
+    const float* __restrict__ delta,
+    int j,
+    int i
+) {
+    return i == 0 ? 1.0f : delta[j * D + i - 1];
+}
+
+template <int D, int K, bool Indexed = false>
+__global__ void mls_packed_forward_kernel(
+    const float* __restrict__ displaced_points,
+    const float* __restrict__ neighbor_positions,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ squared_distances,
+    const float* __restrict__ features,
+    const int64_t* __restrict__ feature_batch,
+    const float* __restrict__ source_points,
+    const int64_t* __restrict__ query_order,
+    float* __restrict__ interpolated,
+    float* __restrict__ field_gradient,
+    float* __restrict__ factors,
+    int32_t* __restrict__ exact_counts,
+    int total_queries,
+    int feature_batches,
+    int source_count,
+    int channels,
+    int queries_per_batch,
+    int queries_per_head,
+    float regularization,
+    float bandwidth_min,
+    float exact_eps
+) {
+    constexpr int P = D + 1;
+    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (storage_qrow >= total_queries) return;
+    const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
+    const int qrow = Indexed
+        ? sample * queries_per_batch + (int)query_order[storage_qrow]
+        : storage_qrow;
+    const int64_t fb = Indexed
+        ? (int64_t)sample * (queries_per_batch / queries_per_head)
+            + ((qrow - sample * queries_per_batch) / queries_per_head)
+        : feature_batch[qrow];
+    if (fb < 0 || fb >= feature_batches) return;
+    const float bandwidth = fmaxf(
+        squared_distances[storage_qrow * K + ((K - 1) / 2)], bandwidth_min);
+
+    float delta[K * D];
+    float weights[K];
+    int exact_count = 0;
+    #pragma unroll
+    for (int j = 0; j < K; ++j) {
+        float dsq = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int64_t source_idx = indices[storage_qrow * K + j];
+            const float neighbor = Indexed
+                ? source_points[(static_cast<int64_t>(sample) * source_count + source_idx) * D + d]
+                : neighbor_positions[(qrow * K + j) * D + d];
+            const float dv = displaced_points[qrow * D + d] - neighbor;
+            delta[j * D + d] = dv;
+            dsq += dv * dv;
+        }
+        weights[j] = expf(-dsq / (2.0f * bandwidth));
+        exact_count += squared_distances[storage_qrow * K + j] <= exact_eps;
+    }
+    exact_counts[storage_qrow] = exact_count;
+
+    if (exact_count > 0) {
+        for (int c = 0; c < channels; ++c) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < K; ++j) {
+                if (squared_distances[storage_qrow * K + j] <= exact_eps) {
+                    sum += features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+                }
+            }
+            interpolated[qrow * channels + c] = sum / (float)exact_count;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) {
+                field_gradient[(qrow * D + d) * channels + c] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    float A[P * P];
+    #pragma unroll
+    for (int i = 0; i < P; ++i) {
+        #pragma unroll
+        for (int l = 0; l < P; ++l) {
+            float s = i == l ? regularization : 0.0f;
+            #pragma unroll
+            for (int j = 0; j < K; ++j) {
+                s += weights[j] * packed_basis_value<D>(delta, j, i)
+                    * packed_basis_value<D>(delta, j, l);
+            }
+            A[i * P + l] = s;
+        }
+    }
+
+    float trace = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < P; ++i) trace += A[i * P + i];
+    const float jitter = fmaxf(1.0e-5f, 1.0e-4f * trace / (float)P);
+    float L[P * P];
+    #pragma unroll
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        int stable = 1;
+        const float diagonal_jitter = attempt == 0 ? 0.0f : jitter;
+        #pragma unroll
+        for (int idx = 0; idx < P * P; ++idx) L[idx] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < P; ++i) {
+            #pragma unroll
+            for (int j = 0; j <= i; ++j) {
+                float s = A[i * P + j] + (i == j ? diagonal_jitter : 0.0f);
+                #pragma unroll
+                for (int kk = 0; kk < P; ++kk) {
+                    if (kk < j) s -= L[i * P + kk] * L[j * P + kk];
+                }
+                if (i == j) {
+                    const float scale = fabsf(A[i * P + i] + diagonal_jitter);
+                    const float floor = fmaxf(1.0e-12f, fminf(1.0e-5f, 1.0e-3f * scale));
+                    if (!(s > floor)) { stable = 0; s = floor; }
+                    factors[storage_qrow * P * P + i * P + i] = s;
+                    L[i * P + i] = sqrtf(s);
+                } else {
+                    const float denom = L[j * P + j];
+                    const float value = denom > 0.0f ? s / denom : 0.0f;
+                    stable &= denom > 0.0f;
+                    L[i * P + j] = value;
+                    factors[storage_qrow * P * P + i * P + j] = value;
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < P; ++j) {
+                if (j > i) factors[storage_qrow * P * P + i * P + j] = 0.0f;
+            }
+        }
+        if (stable) break;
+    }
+
+    for (int c = 0; c < channels; ++c) {
+        float rhs[P] = {};
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            const float f = features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+            #pragma unroll
+            for (int i = 0; i < P; ++i) {
+                rhs[i] += weights[j] * packed_basis_value<D>(delta, j, i) * f;
+            }
+        }
+        float y[P], x[P];
+        #pragma unroll
+        for (int i = 0; i < P; ++i) {
+            float s = rhs[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j < i) s -= L[i * P + j] * y[j];
+            y[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+        #pragma unroll
+        for (int ii = 0; ii < P; ++ii) {
+            const int i = P - 1 - ii;
+            float s = y[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j > i) s -= L[j * P + i] * x[j];
+            x[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+        interpolated[qrow * channels + c] = x[0];
+        #pragma unroll
+        for (int d = 0; d < D; ++d) {
+            field_gradient[(qrow * D + d) * channels + c] = x[d + 1];
+        }
+    }
+}
+
+template <int D, int K, bool Indexed = false>
+__global__ void mls_packed_backward_kernel(
+    const float* __restrict__ displaced_points,
+    const float* __restrict__ neighbor_positions,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ squared_distances,
+    const float* __restrict__ features,
+    const int64_t* __restrict__ feature_batch,
+    const float* __restrict__ source_points,
+    const int64_t* __restrict__ query_order,
+    const float* __restrict__ factors,
+    const int32_t* __restrict__ exact_counts,
+    const float* __restrict__ d_interpolated,
+    const float* __restrict__ d_field_gradient,
+    float* __restrict__ d_features,
+    float* __restrict__ d_displaced_points,
+    int total_queries,
+    int feature_batches,
+    int source_count,
+    int channels,
+    int queries_per_batch,
+    int queries_per_head,
+    float bandwidth_min,
+    float exact_eps
+) {
+    constexpr int P = D + 1;
+    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (storage_qrow >= total_queries) return;
+    const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
+    const int qrow = Indexed
+        ? sample * queries_per_batch + (int)query_order[storage_qrow]
+        : storage_qrow;
+    const int64_t fb = Indexed
+        ? (int64_t)sample * (queries_per_batch / queries_per_head)
+            + ((qrow - sample * queries_per_batch) / queries_per_head)
+        : feature_batch[qrow];
+    if (fb < 0 || fb >= feature_batches) {
+        #pragma unroll
+        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        return;
+    }
+    const int exact_count = exact_counts[storage_qrow];
+    if (exact_count > 0) {
+        for (int c = 0; c < channels; ++c) {
+            const float scale = d_interpolated[qrow * channels + c] / (float)exact_count;
+            #pragma unroll
+            for (int j = 0; j < K; ++j) {
+                if (squared_distances[storage_qrow * K + j] <= exact_eps) {
+                    atomicAdd(&d_features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c], scale);
+                }
+            }
+        }
+        #pragma unroll
+        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        return;
+    }
+
+    float L[P * P];
+    int ill_conditioned = 0;
+    #pragma unroll
+    for (int i = 0; i < P; ++i) {
+        #pragma unroll
+        for (int j = 0; j < P; ++j) {
+            const float stored = factors[storage_qrow * P * P + i * P + j];
+            if (j > i) L[i * P + j] = 0.0f;
+            else if (i == j) {
+                ill_conditioned |= stored <= 0.0f;
+                L[i * P + i] = sqrtf(fmaxf(stored, 0.0f));
+            } else L[i * P + j] = stored;
+        }
+    }
+    if (ill_conditioned) {
+        #pragma unroll
+        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        return;
+    }
+
+    const float bandwidth = fmaxf(
+        squared_distances[storage_qrow * K + ((K - 1) / 2)], bandwidth_min);
+    float delta[K * D];
+    float weights[K];
+    #pragma unroll
+    for (int j = 0; j < K; ++j) {
+        float dsq = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int64_t source_idx = indices[storage_qrow * K + j];
+            const float neighbor = Indexed
+                ? source_points[(static_cast<int64_t>(sample) * source_count + source_idx) * D + d]
+                : neighbor_positions[(qrow * K + j) * D + d];
+            const float dv = displaced_points[qrow * D + d] - neighbor;
+            delta[j * D + d] = dv;
+            dsq += dv * dv;
+        }
+        weights[j] = expf(-dsq / (2.0f * bandwidth));
+    }
+
+    float dq[D] = {};
+    for (int c = 0; c < channels; ++c) {
+        float dx[P];
+        dx[0] = d_interpolated[qrow * channels + c];
+        #pragma unroll
+        for (int d = 0; d < D; ++d) {
+            dx[d + 1] = d_field_gradient == nullptr
+                ? 0.0f : d_field_gradient[(qrow * D + d) * channels + c];
+        }
+        float yg[P], G[P];
+        #pragma unroll
+        for (int i = 0; i < P; ++i) {
+            float s = dx[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j < i) s -= L[i * P + j] * yg[j];
+            yg[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+        #pragma unroll
+        for (int ii = 0; ii < P; ++ii) {
+            const int i = P - 1 - ii;
+            float s = yg[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j > i) s -= L[j * P + i] * G[j];
+            G[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+
+        float rhs[P] = {};
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            const float f = features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+            #pragma unroll
+            for (int i = 0; i < P; ++i) rhs[i] += weights[j] * packed_basis_value<D>(delta, j, i) * f;
+        }
+        float yx[P], x[P];
+        #pragma unroll
+        for (int i = 0; i < P; ++i) {
+            float s = rhs[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j < i) s -= L[i * P + j] * yx[j];
+            yx[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+        #pragma unroll
+        for (int ii = 0; ii < P; ++ii) {
+            const int i = P - 1 - ii;
+            float s = yx[i];
+            #pragma unroll
+            for (int j = 0; j < P; ++j) if (j > i) s -= L[j * P + i] * x[j];
+            x[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            const int64_t src = fb * source_count + indices[storage_qrow * K + j];
+            const float f = features[src * channels + c];
+            float df = 0.0f, ay = 0.0f, fitted = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < P; ++i) {
+                const float phi = packed_basis_value<D>(delta, j, i);
+                df += weights[j] * phi * G[i];
+                ay += phi * G[i];
+                fitted += phi * x[i];
+            }
+            atomicAdd(&d_features[src * channels + c], df);
+            const float residual = f - fitted;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) {
+                dq[d] += weights[j] * (residual * G[d + 1] - ay * x[d + 1])
+                    - ay * residual * weights[j] * delta[j * D + d] / bandwidth;
+            }
+        }
+    }
+    #pragma unroll
+    for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = dq[d];
+}
+
 // Cooperative fused MLS forward kernel.
 //
 // Thread layout per query block:
@@ -21,7 +374,7 @@
 // A is symmetric positive definite; Cholesky is unconditionally stable with λ > 0.
 // Factors output stores L (lower-triangular) for Python diagonal-check fallback.
 
-template <int D, int K>
+template <int D, int K, bool Indexed = false>
 __global__ void mls_fused_forward_kernel(
     const float* __restrict__ displaced_points,   // (M, D)
     const float* __restrict__ neighbor_positions, // (M, K, D)
@@ -29,6 +382,8 @@ __global__ void mls_fused_forward_kernel(
     const float* __restrict__ squared_distances,  // (M, K)
     const float* __restrict__ features,           // (B, N, C)
     const int64_t* __restrict__ feature_batch,    // (M,)
+    const float* __restrict__ source_points,
+    const int64_t* __restrict__ query_order,
     float* __restrict__ interpolated,             // (M, C)
     float* __restrict__ field_gradient,           // (M, D, C)
     float* __restrict__ factors,                  // (M, P, P) — Cholesky L, lower-triangular
@@ -37,13 +392,19 @@ __global__ void mls_fused_forward_kernel(
     int feature_batches,
     int source_count,
     int channels,
+    int queries_per_batch,
+    int queries_per_head,
     float regularization,
     float bandwidth_min,
     float exact_eps
 ) {
     constexpr int P = D + 1;
-    const int qrow = blockIdx.x;
-    if (qrow >= total_queries) return;
+    const int storage_qrow = blockIdx.x;
+    if (storage_qrow >= total_queries) return;
+    const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
+    const int qrow = Indexed
+        ? sample * queries_per_batch + (int)query_order[storage_qrow]
+        : storage_qrow;
 
     __shared__ float   bw_sh;
     __shared__ int64_t fb_sh;
@@ -55,8 +416,12 @@ __global__ void mls_fused_forward_kernel(
 
     // ---- Phase 0: scalars (thread 0 only) ----
     if (threadIdx.x == 0) {
-        fb_sh    = (feature_batch != nullptr) ? feature_batch[qrow] : 0LL;
-        bw_sh    = fmaxf(squared_distances[qrow * K + ((K - 1) / 2)], bandwidth_min);
+        fb_sh = Indexed
+            ? (int64_t)sample * (queries_per_batch / queries_per_head)
+                + ((qrow - sample * queries_per_batch) / queries_per_head)
+            : ((feature_batch != nullptr) ? feature_batch[qrow] : 0LL);
+        bw_sh = fmaxf(
+            squared_distances[storage_qrow * K + ((K - 1) / 2)], bandwidth_min);
         exact_sh = 0;
     }
     __syncthreads();
@@ -68,8 +433,11 @@ __global__ void mls_fused_forward_kernel(
         float dsq = 0.0f;
         #pragma unroll
         for (int d = 0; d < D; ++d) {
-            const float dv = displaced_points[qrow * D + d]
-                           - neighbor_positions[(qrow * K + j) * D + d];
+            const int64_t source_idx = indices[storage_qrow * K + j];
+            const float neighbor = Indexed
+                ? source_points[(static_cast<int64_t>(sample) * source_count + source_idx) * D + d]
+                : neighbor_positions[(qrow * K + j) * D + d];
+            const float dv = displaced_points[qrow * D + d] - neighbor;
             delta[d] = dv;
             dsq     += dv * dv;
         }
@@ -81,7 +449,7 @@ __global__ void mls_fused_forward_kernel(
             basis_sh[j * P + 1 + d] = delta[d];
             wb_sh[j * P + 1 + d]    = w * delta[d];
         }
-        if (squared_distances[qrow * K + j] <= exact_eps) atomicAdd(&exact_sh, 1);
+        if (squared_distances[storage_qrow * K + j] <= exact_eps) atomicAdd(&exact_sh, 1);
     }
     __syncthreads();
 
@@ -138,7 +506,7 @@ __global__ void mls_fused_forward_kernel(
                             stable = 0;
                             s = pivot_floor;
                         }
-                        factors[qrow * P * P + i * P + i] = s;
+                        factors[storage_qrow * P * P + i * P + i] = s;
                         L_sh[i * P + i] = sqrtf(s);
                     } else {
                         const float denom = L_sh[j * P + j];
@@ -149,14 +517,14 @@ __global__ void mls_fused_forward_kernel(
                             stable = 0;
                         }
                         L_sh[i * P + j] = val;
-                        factors[qrow * P * P + i * P + j] = val;
+                        factors[storage_qrow * P * P + i * P + j] = val;
                     }
                 }
                 #pragma unroll
                 for (int j = 0; j < P; ++j) {
                     if (j > i) {
                         L_sh[i * P + j] = 0.0f;
-                        factors[qrow * P * P + i * P + j] = 0.0f;
+                        factors[storage_qrow * P * P + i * P + j] = 0.0f;
                     }
                 }
             }
@@ -165,7 +533,7 @@ __global__ void mls_fused_forward_kernel(
                 break;
             }
         }
-        exact_counts[qrow] = exact_sh;
+        exact_counts[storage_qrow] = exact_sh;
     }
     __syncthreads();
 
@@ -178,8 +546,8 @@ __global__ void mls_fused_forward_kernel(
             float sum = 0.0f;
             #pragma unroll
             for (int j = 0; j < K; ++j) {
-                if (squared_distances[qrow * K + j] <= exact_eps) {
-                    sum += features[(fb * source_count + indices[qrow * K + j]) * channels + c];
+                if (squared_distances[storage_qrow * K + j] <= exact_eps) {
+                    sum += features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
                 }
             }
             interpolated[qrow * channels + c] = sum / (float)exact_sh;
@@ -198,7 +566,7 @@ __global__ void mls_fused_forward_kernel(
         for (int i = 0; i < P; ++i) b[i] = 0.0f;
         #pragma unroll
         for (int j = 0; j < K; ++j) {
-            const float f = features[(fb * source_count + indices[qrow * K + j]) * channels + c];
+            const float f = features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
             #pragma unroll
             for (int i = 0; i < P; ++i) b[i] += wb_sh[j * P + i] * f;
         }
@@ -232,56 +600,6 @@ __global__ void mls_fused_forward_kernel(
     }
 }
 
-template <int D, int K>
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-launch_mls_fused_forward(
-    torch::Tensor displaced_points,
-    torch::Tensor neighbor_positions,
-    torch::Tensor indices,
-    torch::Tensor squared_distances,
-    torch::Tensor features,
-    torch::Tensor feature_batch,
-    float regularization,
-    float bandwidth_min,
-    float exact_eps
-) {
-    constexpr int P = D + 1;
-    const int64_t total_queries = displaced_points.size(0);
-    const int64_t channels      = features.size(2);
-    auto interpolated   = torch::empty({total_queries, channels},    features.options());
-    auto field_gradient = torch::empty({total_queries, D, channels}, features.options());
-    auto factors        = torch::empty({total_queries, P, P},        features.options());
-    auto exact_counts   = torch::empty({total_queries},              indices.options().dtype(torch::kInt32));
-
-    constexpr int threads = 128;
-    mls_fused_forward_kernel<D, K><<<
-        static_cast<unsigned int>(total_queries),
-        threads,
-        0,
-        at::cuda::getCurrentCUDAStream()
-    >>>(
-        displaced_points.data_ptr<float>(),
-        neighbor_positions.data_ptr<float>(),
-        indices.data_ptr<int64_t>(),
-        squared_distances.data_ptr<float>(),
-        features.data_ptr<float>(),
-        feature_batch.data_ptr<int64_t>(),
-        interpolated.data_ptr<float>(),
-        field_gradient.data_ptr<float>(),
-        factors.data_ptr<float>(),
-        exact_counts.data_ptr<int32_t>(),
-        static_cast<int>(total_queries),
-        static_cast<int>(features.size(0)),
-        static_cast<int>(features.size(1)),
-        static_cast<int>(channels),
-        regularization,
-        bandwidth_min,
-        exact_eps
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {interpolated, field_gradient, factors, exact_counts};
-}
-
 // Cooperative fused MLS backward kernel.
 //
 // Inputs:  saved forward state (displaced_points, neighbor_positions, indices,
@@ -304,7 +622,7 @@ launch_mls_fused_forward(
 //          then atomicAdd to shared d_q_sh[d] at end of channel stripe.
 //   Final sync: thread d writes d_q_sh[d] to d_displaced_points[qrow,d].
 
-template <int D, int K>
+template <int D, int K, bool Indexed = false>
 __global__ void mls_fused_backward_kernel(
     const float*    __restrict__ displaced_points,   // (M, D)
     const float*    __restrict__ neighbor_positions, // (M, K, D)
@@ -312,6 +630,8 @@ __global__ void mls_fused_backward_kernel(
     const float*    __restrict__ squared_distances,  // (M, K)
     const float*    __restrict__ features,           // (B, N, C)
     const int64_t*  __restrict__ feature_batch,      // (M,)
+    const float*    __restrict__ source_points,
+    const int64_t*  __restrict__ query_order,
     const float*    __restrict__ factors,            // (M, P, P) saved Cholesky L
     const int32_t*  __restrict__ exact_counts,       // (M,)
     const float*    __restrict__ d_interpolated,     // (M, C)
@@ -322,12 +642,18 @@ __global__ void mls_fused_backward_kernel(
     int feature_batches,
     int source_count,
     int channels,
+    int queries_per_batch,
+    int queries_per_head,
     float bandwidth_min,
     float exact_eps
 ) {
     constexpr int P = D + 1;
-    const int qrow = blockIdx.x;
-    if (qrow >= total_queries) return;
+    const int storage_qrow = blockIdx.x;
+    if (storage_qrow >= total_queries) return;
+    const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
+    const int qrow = Indexed
+        ? sample * queries_per_batch + (int)query_order[storage_qrow]
+        : storage_qrow;
 
     __shared__ float   bw_sh;
     __shared__ int64_t fb_sh;
@@ -341,9 +667,13 @@ __global__ void mls_fused_backward_kernel(
 
     // ---- Phase 0: scalars and L recovery (thread 0) ----
     if (threadIdx.x == 0) {
-        fb_sh    = (feature_batch != nullptr) ? feature_batch[qrow] : 0LL;
-        bw_sh    = fmaxf(squared_distances[qrow * K + ((K - 1) / 2)], bandwidth_min);
-        exact_sh = exact_counts[qrow];
+        fb_sh = Indexed
+            ? (int64_t)sample * (queries_per_batch / queries_per_head)
+                + ((qrow - sample * queries_per_batch) / queries_per_head)
+            : ((feature_batch != nullptr) ? feature_batch[qrow] : 0LL);
+        bw_sh = fmaxf(
+            squared_distances[storage_qrow * K + ((K - 1) / 2)], bandwidth_min);
+        exact_sh = exact_counts[storage_qrow];
         // Recover L from stored factors:
         //   diagonal: stored raw residual s → L[i,i] = sqrt(max(s,0))
         //   lower off-diagonal: stored directly
@@ -353,7 +683,7 @@ __global__ void mls_fused_backward_kernel(
         for (int i = 0; i < P; ++i) {
             #pragma unroll
             for (int j = 0; j < P; ++j) {
-                const float stored = factors[qrow * P * P + i * P + j];
+                const float stored = factors[storage_qrow * P * P + i * P + j];
                 if (j > i) {
                     L_sh[i * P + j] = 0.0f;
                 } else if (i == j) {
@@ -378,8 +708,11 @@ __global__ void mls_fused_backward_kernel(
         float dsq = 0.0f;
         #pragma unroll
         for (int d = 0; d < D; ++d) {
-            const float dv = displaced_points[qrow * D + d]
-                           - neighbor_positions[(qrow * K + j) * D + d];
+            const int64_t source_idx = indices[storage_qrow * K + j];
+            const float neighbor = Indexed
+                ? source_points[(static_cast<int64_t>(sample) * source_count + source_idx) * D + d]
+                : neighbor_positions[(qrow * K + j) * D + d];
+            const float dv = displaced_points[qrow * D + d] - neighbor;
             delta[d] = dv;
             dsq     += dv * dv;
         }
@@ -408,9 +741,9 @@ __global__ void mls_fused_backward_kernel(
             const float scale = d_interpolated[qrow * channels + c] / (float)exact_sh;
             #pragma unroll
             for (int j = 0; j < K; ++j) {
-                if (squared_distances[qrow * K + j] <= exact_eps) {
+                if (squared_distances[storage_qrow * K + j] <= exact_eps) {
                     atomicAdd(
-                        &d_features[(fb * source_count + indices[qrow * K + j]) * channels + c],
+                        &d_features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c],
                         scale
                     );
                 }
@@ -472,7 +805,7 @@ __global__ void mls_fused_backward_kernel(
         #pragma unroll
         for (int j = 0; j < K; ++j) {
             const float fval =
-                features[(fb * source_count + indices[qrow * K + j]) * channels + c];
+                features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
             #pragma unroll
             for (int i = 0; i < P; ++i) b[i] += wb_sh[j * P + i] * fval;
         }
@@ -504,7 +837,7 @@ __global__ void mls_fused_backward_kernel(
 
         #pragma unroll
         for (int j = 0; j < K; ++j) {
-            const int64_t src = fb * source_count + indices[qrow * K + j];
+            const int64_t src = fb * source_count + indices[storage_qrow * K + j];
             const float fval  = features[src * channels + c];
             const float w_j   = wb_sh[j * P];   // wb[j,0] = w_j * φ_j[0] = w_j
 
@@ -550,190 +883,254 @@ __global__ void mls_fused_backward_kernel(
 }
 
 template <int D, int K>
-static std::tuple<torch::Tensor, torch::Tensor>
-launch_mls_fused_backward(
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+launch_mls_packed_indexed_forward(
     torch::Tensor displaced_points,
-    torch::Tensor neighbor_positions,
+    torch::Tensor source_points,
     torch::Tensor indices,
     torch::Tensor squared_distances,
     torch::Tensor features,
-    torch::Tensor feature_batch,
-    torch::Tensor factors,
-    torch::Tensor exact_counts,
-    torch::Tensor d_interpolated,
-    torch::Tensor d_field_gradient,  // numel()==0 signals "not used"
+    torch::Tensor query_order,
+    int queries_per_batch,
+    int queries_per_head,
+    float regularization,
     float bandwidth_min,
     float exact_eps
 ) {
     constexpr int P = D + 1;
-    const int64_t total_queries    = displaced_points.size(0);
-    const int64_t channels         = features.size(2);
-    const int64_t feature_batches  = features.size(0);
-    const int64_t source_count     = features.size(1);
-
-    auto d_features       = torch::zeros_like(features);
-    auto d_displaced      = torch::empty_like(displaced_points);
-
-    const float* d_field_grad_ptr =
-        (d_field_gradient.numel() > 0) ? d_field_gradient.data_ptr<float>() : nullptr;
-
+    const int total_queries = static_cast<int>(displaced_points.size(0));
+    const int channels = static_cast<int>(features.size(2));
+    auto interpolated = torch::empty({total_queries, channels}, features.options());
+    auto field_gradient = torch::empty({total_queries, D, channels}, features.options());
+    auto factors = torch::empty({total_queries, P, P}, features.options());
+    auto exact_counts = torch::empty({total_queries}, indices.options().dtype(torch::kInt32));
     constexpr int threads = 128;
-    mls_fused_backward_kernel<D, K><<<
-        static_cast<unsigned int>(total_queries),
-        threads,
-        0,
-        at::cuda::getCurrentCUDAStream()
-    >>>(
-        displaced_points.data_ptr<float>(),
-        neighbor_positions.data_ptr<float>(),
-        indices.data_ptr<int64_t>(),
-        squared_distances.data_ptr<float>(),
-        features.data_ptr<float>(),
-        feature_batch.data_ptr<int64_t>(),
-        factors.data_ptr<float>(),
-        exact_counts.data_ptr<int32_t>(),
-        d_interpolated.data_ptr<float>(),
-        d_field_grad_ptr,
-        d_features.data_ptr<float>(),
-        d_displaced.data_ptr<float>(),
-        static_cast<int>(total_queries),
-        static_cast<int>(feature_batches),
-        static_cast<int>(source_count),
-        static_cast<int>(channels),
-        bandwidth_min,
-        exact_eps
-    );
+    const int blocks = (total_queries + threads - 1) / threads;
+    mls_packed_forward_kernel<D, K, true><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        displaced_points.data_ptr<float>(), nullptr,
+        indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
+        features.data_ptr<float>(), nullptr,
+        source_points.data_ptr<float>(), query_order.data_ptr<int64_t>(),
+        interpolated.data_ptr<float>(), field_gradient.data_ptr<float>(),
+        factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
+        total_queries, static_cast<int>(features.size(0)),
+        static_cast<int>(features.size(1)), channels,
+        queries_per_batch, queries_per_head,
+        regularization, bandwidth_min, exact_eps);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {d_features, d_displaced};
+    return {interpolated, field_gradient, factors, exact_counts};
 }
 
-std::tuple<torch::Tensor, torch::Tensor> mls_fused_backward_cuda(
+template <int D, int K>
+static std::tuple<torch::Tensor, torch::Tensor>
+launch_mls_packed_indexed_backward(
     torch::Tensor displaced_points,
-    torch::Tensor neighbor_positions,
+    torch::Tensor source_points,
     torch::Tensor indices,
     torch::Tensor squared_distances,
     torch::Tensor features,
-    torch::Tensor feature_batch,
+    torch::Tensor query_order,
     torch::Tensor factors,
     torch::Tensor exact_counts,
     torch::Tensor d_interpolated,
     torch::Tensor d_field_gradient,
-    double bandwidth_min,
-    double exact_eps
+    int queries_per_batch,
+    int queries_per_head,
+    float bandwidth_min,
+    float exact_eps
 ) {
-    TORCH_CHECK(displaced_points.is_cuda(),         "mls_fused_backward: displaced_points must be CUDA");
-    TORCH_CHECK(neighbor_positions.is_cuda(),       "mls_fused_backward: neighbor_positions must be CUDA");
-    TORCH_CHECK(indices.is_cuda(),                  "mls_fused_backward: indices must be CUDA");
-    TORCH_CHECK(squared_distances.is_cuda(),        "mls_fused_backward: squared_distances must be CUDA");
-    TORCH_CHECK(features.is_cuda(),                 "mls_fused_backward: features must be CUDA");
-    TORCH_CHECK(feature_batch.is_cuda(),            "mls_fused_backward: feature_batch must be CUDA");
-    TORCH_CHECK(factors.is_cuda(),                  "mls_fused_backward: factors must be CUDA");
-    TORCH_CHECK(exact_counts.is_cuda(),             "mls_fused_backward: exact_counts must be CUDA");
-    TORCH_CHECK(d_interpolated.is_cuda(),           "mls_fused_backward: d_interpolated must be CUDA");
-    TORCH_CHECK(displaced_points.is_contiguous(),   "mls_fused_backward: displaced_points must be contiguous");
-    TORCH_CHECK(neighbor_positions.is_contiguous(), "mls_fused_backward: neighbor_positions must be contiguous");
-    TORCH_CHECK(indices.is_contiguous(),            "mls_fused_backward: indices must be contiguous");
-    TORCH_CHECK(squared_distances.is_contiguous(),  "mls_fused_backward: squared_distances must be contiguous");
-    TORCH_CHECK(features.is_contiguous(),           "mls_fused_backward: features must be contiguous");
-    TORCH_CHECK(feature_batch.is_contiguous(),      "mls_fused_backward: feature_batch must be contiguous");
-    TORCH_CHECK(factors.is_contiguous(),            "mls_fused_backward: factors must be contiguous");
-    TORCH_CHECK(exact_counts.is_contiguous(),       "mls_fused_backward: exact_counts must be contiguous");
-    TORCH_CHECK(d_interpolated.is_contiguous(),     "mls_fused_backward: d_interpolated must be contiguous");
-    TORCH_CHECK(displaced_points.scalar_type()   == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(neighbor_positions.scalar_type() == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(squared_distances.scalar_type()  == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(features.scalar_type()           == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(factors.scalar_type()            == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(d_interpolated.scalar_type()     == torch::kFloat32, "mls_fused_backward: float32 required");
-    TORCH_CHECK(indices.scalar_type()    == torch::kInt64,  "mls_fused_backward: indices must be int64");
-    TORCH_CHECK(feature_batch.scalar_type() == torch::kInt64, "mls_fused_backward: feature_batch must be int64");
-    TORCH_CHECK(exact_counts.scalar_type() == torch::kInt32, "mls_fused_backward: exact_counts must be int32");
-    TORCH_CHECK(displaced_points.size(1) == 2 || displaced_points.size(1) == 3,
-        "mls_fused_backward: D must be 2 or 3");
-    TORCH_CHECK(
-        neighbor_positions.size(1) == 4 || neighbor_positions.size(1) == 8 || neighbor_positions.size(1) == 16,
-        "mls_fused_backward: K must be 4, 8, or 16");
-    if (d_field_gradient.numel() > 0) {
-        TORCH_CHECK(d_field_gradient.is_cuda(),       "mls_fused_backward: d_field_gradient must be CUDA");
-        TORCH_CHECK(d_field_gradient.is_contiguous(), "mls_fused_backward: d_field_gradient must be contiguous");
-        TORCH_CHECK(d_field_gradient.scalar_type() == torch::kFloat32,
-            "mls_fused_backward: d_field_gradient must be float32");
-    }
-
-    c10::cuda::CUDAGuard device_guard(features.device());
-
-    const int dim = static_cast<int>(displaced_points.size(1));
-    const int k   = static_cast<int>(neighbor_positions.size(1));
-    if (dim == 2 && k ==  4) return launch_mls_fused_backward<2,  4>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 2 && k ==  8) return launch_mls_fused_backward<2,  8>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 2 && k == 16) return launch_mls_fused_backward<2, 16>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 3 && k ==  4) return launch_mls_fused_backward<3,  4>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 3 && k ==  8) return launch_mls_fused_backward<3,  8>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
-    return                        launch_mls_fused_backward<3, 16>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, factors, exact_counts, d_interpolated, d_field_gradient, (float)bandwidth_min, (float)exact_eps);
+    const int total_queries = static_cast<int>(displaced_points.size(0));
+    const int channels = static_cast<int>(features.size(2));
+    auto d_features = torch::zeros_like(features);
+    auto d_displaced = torch::empty_like(displaced_points);
+    const float* d_field_ptr = d_field_gradient.numel() > 0
+        ? d_field_gradient.data_ptr<float>() : nullptr;
+    constexpr int threads = 128;
+    const int blocks = (total_queries + threads - 1) / threads;
+    mls_packed_backward_kernel<D, K, true><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        displaced_points.data_ptr<float>(), nullptr,
+        indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
+        features.data_ptr<float>(), nullptr,
+        source_points.data_ptr<float>(), query_order.data_ptr<int64_t>(),
+        factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
+        d_interpolated.data_ptr<float>(), d_field_ptr,
+        d_features.data_ptr<float>(), d_displaced.data_ptr<float>(),
+        total_queries, static_cast<int>(features.size(0)),
+        static_cast<int>(features.size(1)), channels,
+        queries_per_batch, queries_per_head, bandwidth_min, exact_eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {d_features, d_displaced};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mls_fused_forward_cuda(
+// Wide-channel indexed specialization. It retains Morton-ordered storage and
+// in-kernel source-position loads, while assigning one cooperative block to a
+// query so feature channels are processed in parallel.
+template <int D, int K>
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+launch_mls_cooperative_indexed_forward(
     torch::Tensor displaced_points,
-    torch::Tensor neighbor_positions,
+    torch::Tensor source_points,
     torch::Tensor indices,
     torch::Tensor squared_distances,
     torch::Tensor features,
-    torch::Tensor feature_batch,
+    torch::Tensor query_order,
+    int queries_per_batch,
+    int queries_per_head,
+    float regularization,
+    float bandwidth_min,
+    float exact_eps
+) {
+    constexpr int P = D + 1;
+    const int total_queries = static_cast<int>(displaced_points.size(0));
+    const int channels = static_cast<int>(features.size(2));
+    auto interpolated = torch::empty({total_queries, channels}, features.options());
+    auto field_gradient = torch::empty({total_queries, D, channels}, features.options());
+    auto factors = torch::empty({total_queries, P, P}, features.options());
+    auto exact_counts = torch::empty(
+        {total_queries}, indices.options().dtype(torch::kInt32));
+    constexpr int threads = 128;
+    mls_fused_forward_kernel<D, K, true><<<
+        static_cast<unsigned int>(total_queries), threads, 0,
+        at::cuda::getCurrentCUDAStream()
+    >>>(
+        displaced_points.data_ptr<float>(), nullptr,
+        indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
+        features.data_ptr<float>(), nullptr,
+        source_points.data_ptr<float>(), query_order.data_ptr<int64_t>(),
+        interpolated.data_ptr<float>(), field_gradient.data_ptr<float>(),
+        factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
+        total_queries, static_cast<int>(features.size(0)),
+        static_cast<int>(features.size(1)), channels,
+        queries_per_batch, queries_per_head,
+        regularization, bandwidth_min, exact_eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {interpolated, field_gradient, factors, exact_counts};
+}
+
+template <int D, int K>
+static std::tuple<torch::Tensor, torch::Tensor>
+launch_mls_cooperative_indexed_backward(
+    torch::Tensor displaced_points,
+    torch::Tensor source_points,
+    torch::Tensor indices,
+    torch::Tensor squared_distances,
+    torch::Tensor features,
+    torch::Tensor query_order,
+    torch::Tensor factors,
+    torch::Tensor exact_counts,
+    torch::Tensor d_interpolated,
+    torch::Tensor d_field_gradient,
+    int queries_per_batch,
+    int queries_per_head,
+    float bandwidth_min,
+    float exact_eps
+) {
+    const int total_queries = static_cast<int>(displaced_points.size(0));
+    const int channels = static_cast<int>(features.size(2));
+    auto d_features = torch::zeros_like(features);
+    auto d_displaced = torch::empty_like(displaced_points);
+    const float* d_field_ptr = d_field_gradient.numel() > 0
+        ? d_field_gradient.data_ptr<float>() : nullptr;
+    constexpr int threads = 128;
+    mls_fused_backward_kernel<D, K, true><<<
+        static_cast<unsigned int>(total_queries), threads, 0,
+        at::cuda::getCurrentCUDAStream()
+    >>>(
+        displaced_points.data_ptr<float>(), nullptr,
+        indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
+        features.data_ptr<float>(), nullptr,
+        source_points.data_ptr<float>(), query_order.data_ptr<int64_t>(),
+        factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
+        d_interpolated.data_ptr<float>(), d_field_ptr,
+        d_features.data_ptr<float>(), d_displaced.data_ptr<float>(),
+        total_queries, static_cast<int>(features.size(0)),
+        static_cast<int>(features.size(1)), channels,
+        queries_per_batch, queries_per_head, bandwidth_min, exact_eps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {d_features, d_displaced};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mls_packed_indexed_forward_cuda(
+    torch::Tensor displaced_points,
+    torch::Tensor source_points,
+    torch::Tensor indices,
+    torch::Tensor squared_distances,
+    torch::Tensor features,
+    torch::Tensor query_order,
+    int queries_per_batch,
+    int queries_per_head,
     double regularization,
     double bandwidth_min,
     double exact_eps
 ) {
-    TORCH_CHECK(displaced_points.is_cuda(),         "mls_fused_forward: displaced_points must be CUDA");
-    TORCH_CHECK(neighbor_positions.is_cuda(),       "mls_fused_forward: neighbor_positions must be CUDA");
-    TORCH_CHECK(indices.is_cuda(),                  "mls_fused_forward: indices must be CUDA");
-    TORCH_CHECK(squared_distances.is_cuda(),        "mls_fused_forward: squared_distances must be CUDA");
-    TORCH_CHECK(features.is_cuda(),                 "mls_fused_forward: features must be CUDA");
-    TORCH_CHECK(feature_batch.is_cuda(),            "mls_fused_forward: feature_batch must be CUDA");
-    TORCH_CHECK(displaced_points.is_contiguous(),   "mls_fused_forward: displaced_points must be contiguous");
-    TORCH_CHECK(neighbor_positions.is_contiguous(), "mls_fused_forward: neighbor_positions must be contiguous");
-    TORCH_CHECK(indices.is_contiguous(),            "mls_fused_forward: indices must be contiguous");
-    TORCH_CHECK(squared_distances.is_contiguous(),  "mls_fused_forward: squared_distances must be contiguous");
-    TORCH_CHECK(features.is_contiguous(),           "mls_fused_forward: features must be contiguous");
-    TORCH_CHECK(feature_batch.is_contiguous(),      "mls_fused_forward: feature_batch must be contiguous");
-    TORCH_CHECK(displaced_points.scalar_type()   == torch::kFloat32, "mls_fused_forward: displaced_points must be float32");
-    TORCH_CHECK(neighbor_positions.scalar_type() == torch::kFloat32, "mls_fused_forward: neighbor_positions must be float32");
-    TORCH_CHECK(squared_distances.scalar_type()  == torch::kFloat32, "mls_fused_forward: squared_distances must be float32");
-    TORCH_CHECK(features.scalar_type()           == torch::kFloat32, "mls_fused_forward: features must be float32");
-    TORCH_CHECK(indices.scalar_type()            == torch::kInt64,   "mls_fused_forward: indices must be int64");
-    TORCH_CHECK(feature_batch.scalar_type()      == torch::kInt64,   "mls_fused_forward: feature_batch must be int64");
-    TORCH_CHECK(displaced_points.dim()   == 2, "mls_fused_forward: displaced_points must have shape (M, D)");
-    TORCH_CHECK(neighbor_positions.dim() == 3, "mls_fused_forward: neighbor_positions must have shape (M, K, D)");
-    TORCH_CHECK(indices.dim()            == 2, "mls_fused_forward: indices must have shape (M, K)");
-    TORCH_CHECK(squared_distances.dim()  == 2, "mls_fused_forward: squared_distances must have shape (M, K)");
-    TORCH_CHECK(features.dim()           == 3, "mls_fused_forward: features must have shape (B, N, C)");
-    TORCH_CHECK(feature_batch.dim()      == 1, "mls_fused_forward: feature_batch must have shape (M,)");
-    TORCH_CHECK(displaced_points.size(0) == neighbor_positions.size(0), "mls_fused_forward: M mismatch");
-    TORCH_CHECK(displaced_points.size(0) == indices.size(0),            "mls_fused_forward: M mismatch");
-    TORCH_CHECK(displaced_points.size(0) == squared_distances.size(0),  "mls_fused_forward: M mismatch");
-    TORCH_CHECK(displaced_points.size(0) == feature_batch.size(0),      "mls_fused_forward: M mismatch");
-    TORCH_CHECK(displaced_points.size(1) == neighbor_positions.size(2), "mls_fused_forward: D mismatch");
-    TORCH_CHECK(indices.size(1)          == neighbor_positions.size(1), "mls_fused_forward: K mismatch");
-    TORCH_CHECK(squared_distances.size(1)== neighbor_positions.size(1), "mls_fused_forward: K mismatch");
-    TORCH_CHECK(displaced_points.size(1) == 2 || displaced_points.size(1) == 3,
-        "mls_fused_forward: D must be 2 or 3");
-    TORCH_CHECK(
-        neighbor_positions.size(1) == 4 || neighbor_positions.size(1) == 8 || neighbor_positions.size(1) == 16,
-        "mls_fused_forward: K must be 4, 8, or 16");
-    TORCH_CHECK(features.size(2) >= 1, "mls_fused_forward: features must have at least one channel");
-    TORCH_CHECK(displaced_points.device()  == features.device(), "mls_fused_forward: device mismatch");
-    TORCH_CHECK(neighbor_positions.device()== features.device(), "mls_fused_forward: device mismatch");
-    TORCH_CHECK(indices.device()           == features.device(), "mls_fused_forward: device mismatch");
-    TORCH_CHECK(squared_distances.device() == features.device(), "mls_fused_forward: device mismatch");
-    TORCH_CHECK(feature_batch.device()     == features.device(), "mls_fused_forward: device mismatch");
-
+    const char* op = "mls_packed_indexed_forward";
+    TORCH_CHECK(displaced_points.is_cuda() && source_points.is_cuda()
+                && indices.is_cuda() && squared_distances.is_cuda()
+                && features.is_cuda() && query_order.is_cuda(), op, ": CUDA inputs required");
+    TORCH_CHECK(displaced_points.is_contiguous() && source_points.is_contiguous()
+                && indices.is_contiguous() && squared_distances.is_contiguous()
+                && features.is_contiguous() && query_order.is_contiguous(),
+                op, ": contiguous inputs required");
+    TORCH_CHECK(features.size(2) >= 1,
+                op, ": channels must be positive");
+    TORCH_CHECK(queries_per_batch >= 1 && queries_per_head >= 1
+                && queries_per_batch % queries_per_head == 0,
+                op, ": invalid query layout");
     c10::cuda::CUDAGuard device_guard(features.device());
-
     const int dim = static_cast<int>(displaced_points.size(1));
-    const int k   = static_cast<int>(neighbor_positions.size(1));
-    if (dim == 2 && k ==  4) return launch_mls_fused_forward<2,  4>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 2 && k ==  8) return launch_mls_fused_forward<2,  8>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 2 && k == 16) return launch_mls_fused_forward<2, 16>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 3 && k ==  4) return launch_mls_fused_forward<3,  4>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
-    if (dim == 3 && k ==  8) return launch_mls_fused_forward<3,  8>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
-    return                        launch_mls_fused_forward<3, 16>(displaced_points, neighbor_positions, indices, squared_distances, features, feature_batch, (float)regularization, (float)bandwidth_min, (float)exact_eps);
+    const int k = static_cast<int>(indices.size(1));
+#define DISPATCH_INDEXED_FWD(D, K) \
+    do { \
+        if (features.size(2) <= 32) \
+            return launch_mls_packed_indexed_forward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
+        return launch_mls_cooperative_indexed_forward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
+    } while (false)
+    if (dim == 2 && k == 4) DISPATCH_INDEXED_FWD(2, 4);
+    if (dim == 2 && k == 8) DISPATCH_INDEXED_FWD(2, 8);
+    if (dim == 2 && k == 16) DISPATCH_INDEXED_FWD(2, 16);
+    if (dim == 3 && k == 4) DISPATCH_INDEXED_FWD(3, 4);
+    if (dim == 3 && k == 8) DISPATCH_INDEXED_FWD(3, 8);
+    TORCH_CHECK(dim == 3 && k == 16, op, ": D must be 2/3 and K must be 4/8/16");
+    DISPATCH_INDEXED_FWD(3, 16);
+#undef DISPATCH_INDEXED_FWD
+}
+
+std::tuple<torch::Tensor, torch::Tensor> mls_packed_indexed_backward_cuda(
+    torch::Tensor displaced_points,
+    torch::Tensor source_points,
+    torch::Tensor indices,
+    torch::Tensor squared_distances,
+    torch::Tensor features,
+    torch::Tensor query_order,
+    torch::Tensor factors,
+    torch::Tensor exact_counts,
+    torch::Tensor d_interpolated,
+    torch::Tensor d_field_gradient,
+    int queries_per_batch,
+    int queries_per_head,
+    double bandwidth_min,
+    double exact_eps
+) {
+    const char* op = "mls_packed_indexed_backward";
+    TORCH_CHECK(features.is_cuda() && displaced_points.is_cuda(), op, ": CUDA inputs required");
+    TORCH_CHECK(features.size(2) >= 1,
+                op, ": channels must be positive");
+    c10::cuda::CUDAGuard device_guard(features.device());
+    const int dim = static_cast<int>(displaced_points.size(1));
+    const int k = static_cast<int>(indices.size(1));
+#define DISPATCH_INDEXED_BWD(D, K) \
+    do { \
+        if (features.size(2) <= 32) \
+            return launch_mls_packed_indexed_backward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, factors, exact_counts, d_interpolated, d_field_gradient, queries_per_batch, queries_per_head, (float)bandwidth_min, (float)exact_eps); \
+        return launch_mls_cooperative_indexed_backward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, factors, exact_counts, d_interpolated, d_field_gradient, queries_per_batch, queries_per_head, (float)bandwidth_min, (float)exact_eps); \
+    } while (false)
+    if (dim == 2 && k == 4) DISPATCH_INDEXED_BWD(2, 4);
+    if (dim == 2 && k == 8) DISPATCH_INDEXED_BWD(2, 8);
+    if (dim == 2 && k == 16) DISPATCH_INDEXED_BWD(2, 16);
+    if (dim == 3 && k == 4) DISPATCH_INDEXED_BWD(3, 4);
+    if (dim == 3 && k == 8) DISPATCH_INDEXED_BWD(3, 8);
+    TORCH_CHECK(dim == 3 && k == 16, op, ": D must be 2/3 and K must be 4/8/16");
+    DISPATCH_INDEXED_BWD(3, 16);
+#undef DISPATCH_INDEXED_BWD
 }

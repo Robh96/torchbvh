@@ -1,13 +1,12 @@
 # API Reference
 
-This page is a manual reference for the stable public `torchbvh` API. It does not
-use autodoc or import the CUDA extension during documentation builds.
+This page is a manual reference for the stable public `torchbvh` API. It does not use autodoc or import the CUDA extension during documentation builds.
 
-All geometry APIs expect finite CUDA `float32` tensors unless a section states
-otherwise. Public APIs accept non-contiguous PyTorch views and may make
-layout-only contiguous copies internally for CUDA kernels. Supported dimensions
-are `D in {2, 3}` and supported k-NN sizes are `k in {4, 8, 16}`. Neighbor
-distances are squared Euclidean distances sorted in ascending order.
+- All geometry APIs expect finite CUDA `float32` tensors unless a section states otherwise.
+- Public APIs accept non-contiguous PyTorch views and may make layout-only contiguous copies internally for CUDA kernels. 
+- Supported dimensions are `D in {2, 3}` and supported k-NN sizes are `k in {4, 8, 16}`.
+- Neighbor distances are squared Euclidean distances sorted in ascending order.
+- Point-build workloads must fit in signed 32-bit indexing (`B * N <= 2^31 - 1`).
 
 ## Class-Based API
 
@@ -26,8 +25,7 @@ Input forms:
 - `points: (total_N, D)` with `batch_offsets: (B + 1,)` builds a packed ragged
   BVH.
 
-`batch_offsets` must be CUDA `int64`, start at `0`, end at `total_N`, and be
-strictly increasing. Ragged samples must each contain at least `k` points for the
+`batch_offsets` must be CUDA `int64`, start at `0`, end at `total_N`, and be strictly increasing. Ragged samples must each contain at least `k` points for the
 later query.
 
 Methods and properties:
@@ -39,44 +37,24 @@ bvh.interpolate(displaced_points, features, k=8, *, return_grad=False)
 bvh.destroy() -> None
 ```
 
-`knn(...)` dispatches to `query_knn(...)` using the owned handle. Single-sample
-queries use `query_points: (M, D)` and return `(M, k)` tensors. Fixed-size
-batched queries use `query_points: (B, M, D)` and return `(B, M, k)` tensors.
-Ragged queries require `query_offsets: (B + 1,)` and return packed
-`(total_M, k)` tensors. Indices are local to each source sample.
+`knn(...)` dispatches to `query_knn(...)` using the owned handle. Single-sample queries use `query_points: (M, D)` and return `(M, k)` tensors.
 
-When `source_points` is provided, `knn(...)` returns
-`(indices, squared_distances, neighbor_positions)`. Neighbor positions have shape
-`(M, k, D)`, `(B, M, k, D)`, or `(total_M, k, D)` for single, batched, and
+Fixed-size batched queries use `query_points: (B, M, D)` and return `(B, M, k)` tensors.
+
+Ragged queries require `query_offsets: (B + 1,)` and return packed `(total_M, k)` tensors. Indices are local to each source sample.
+
+When `source_points` is provided, `knn(...)` returns `(indices, squared_distances, neighbor_positions)`. 
+
+Neighbor positions have shape `(M, k, D)`, `(B, M, k, D)`, or `(total_M, k, D)` for single, batched, and
 ragged queries.
 
 `interpolate(...)` runs MLS interpolation for single and fixed-size batched BVHs.
-It raises `TypeError` for ragged BVHs. Use the same shapes as
-`mls_interpolate(...)`.
+It raises `TypeError` for ragged BVHs. Use the same shapes as `mls_interpolate(...)`.
 
 `BVH` supports context-manager use. Leaving the `with` block calls `destroy()`.
 `destroy()` is idempotent. Calling methods after destruction raises
 `RuntimeError`.
 
-### `BatchedBVH`
-
-```python
-BatchedBVH(points: torch.Tensor)
-```
-
-Convenience subclass for fixed-size batches. `points` must have shape
-`(B, N, D)`. It has the same methods and lifecycle behavior as `BVH(points)`.
-Passing a non-3-D tensor raises `ValueError`.
-
-### `RaggedBVH`
-
-```python
-RaggedBVH(points: torch.Tensor, batch_offsets: torch.Tensor)
-```
-
-Convenience subclass for packed variable-size batches. Equivalent to
-`BVH(points, batch_offsets=batch_offsets)`. It supports `knn(...)` with
-`query_offsets` and lifecycle methods. `interpolate(...)` raises `TypeError`.
 
 ### `RayBVH` and `raytrace`
 
@@ -86,33 +64,31 @@ bvh.trace(origins, directions, *, t_min=1e-7, t_max=float("inf"))
 raytrace(primitives, origins, directions, *, primitive_type, t_min=1e-7, t_max=float("inf"))
 ```
 
-Segments have shape `(F,2,2)` or `(B,F,2,2)` and triangles have shape
-`(F,3,3)` or `(B,F,3,3)`. Single-BVH rays may have shape `(...,D)`; batched
-rays use `(B,...,D)`. Fixed-size batches build one independent BVH per sample,
-while every token/head ray in that sample traverses the same BVH.
+Segments have shape `(F,2,2)` or `(B,F,2,2)` and triangles have shape `(F,3,3)` or `(B,F,3,3)`. Single-BVH rays may have shape `(...,D)`;
+batched rays use `(B,...,D)`. Fixed-size batches build one independent BVH per sample, while every token/head ray in that sample traverses the same BVH.
 
-Both calls return `RayHitResult(primitive_indices, t, points, mask)`. Misses use
-index `-1`, `t=inf`, `points=nan`, and `mask=False`. Directions need not be
-normalized. Bounds are scalar and inclusive. Triangles are double-sided.
-`RayBVH` supports `.destroyed`, idempotent `.destroy()`, and context-manager use;
-geometry must not change while its BVH is reused.
+Both calls return `RayHitResult(primitive_indices, t, points, mask)`. Misses use index `-1`, `t=inf`, `points=nan`, and `mask=False`.
+Directions need not be normalized. Bounds are scalar and inclusive. Triangles are double-sided.
+
+The segment implementation fuses closest-hit outputs and uses a native analytic backward. The triangle implementation uses its triangle-specific traversal and PyTorch reconstruction. Both provide first-order gradients; higher-order autograd is not supported.
+
+`RayBVH` supports `.destroyed`, idempotent `.destroy()`, and context-manager use; geometry must not change while its BVH is reused.
 
 ## Handles And Lifecycle
 
 ### `BVHHandle`, `BatchedBVHHandle`, `RaggedBVHHandle`
 
-Builder functions return Python handle objects that own tensor payload
-references used by query functions.
+Builder functions return Python handle objects that own tensor payload references used by query functions.
+
 
 Handle behavior:
-
 - Handles expose `destroyed -> bool`.
 - `destroy_bvh(handle)` or `handle.destroy()` releases Python tensor references.
 - Destroying a handle more than once is allowed.
 - Reading a destroyed handle or querying with it raises `RuntimeError`.
-- Passing the wrong handle variant to a per-variant query raises `TypeError`.
+- Passing an unsupported handle type raises `TypeError`.
 
-Handles are mapping-like compatibility objects for low-level procedural code.
+Handles expose mapping access for low-level procedural code.
 Class wrappers such as `BVH` intentionally do not expose mapping access.
 
 `RaggedBVHHandle` owns per-sample inner handles. Destroying it cascades to those
@@ -121,19 +97,22 @@ inner handles.
 ### `destroy_bvh`
 
 ```python
-destroy_bvh(bvh: BVHHandle | BatchedBVHHandle | RaggedBVHHandle | dict) -> None
+destroy_bvh(bvh: BVHHandle | BatchedBVHHandle | RaggedBVHHandle) -> None
 ```
 
-Destroys a handle or legacy plain dictionary returned by older builder paths.
-Unsupported objects raise `TypeError`.
+Destroys a handle returned by `build_bvh`. Plain dictionaries and other
+unsupported objects raise `TypeError`.
 
 ## Build And Query Functions
 
 ### `build_bvh`
 
 ```python
-build_bvh(points: torch.Tensor, *, batch_offsets: torch.Tensor | None = None)
-    -> BVHHandle | BatchedBVHHandle | RaggedBVHHandle
+build_bvh(
+    points: torch.Tensor,
+    *,
+    batch_offsets: torch.Tensor | None = None
+) -> BVHHandle | BatchedBVHHandle | RaggedBVHHandle
 ```
 
 Unified builder. It dispatches by input rank and `batch_offsets`:
@@ -144,25 +123,6 @@ Unified builder. It dispatches by input rank and `batch_offsets`:
 
 Invalid ranks, dimensions, dtype, device, or ragged shape mismatches raise
 `ValueError`.
-
-### `build_bvh_batched`
-
-```python
-build_bvh_batched(points: torch.Tensor) -> BatchedBVHHandle
-```
-
-Backward-compatible fixed-size batched builder. `points` must be
-`(B, N, D)`.
-
-### `build_bvh_ragged`
-
-```python
-build_bvh_ragged(points: torch.Tensor, batch_offsets: torch.Tensor) -> RaggedBVHHandle
-```
-
-Backward-compatible ragged builder. `points` is `(total_N, D)` and
-`batch_offsets` is `(B + 1,)`. Ragged neighbor indices are local within each
-sample, not global packed-row indices.
 
 ### `query_knn`
 
@@ -193,56 +153,18 @@ Shape contracts:
 | `BatchedBVHHandle` | `(B, M, D)` | none | `(B, M, k)` | `(B, M, k, D)` |
 | `RaggedBVHHandle` | `(total_M, D)` | `query_offsets: (B + 1,)` | `(total_M, k)` | `(total_M, k, D)` |
 
-`indices` are `int64` local source indices. `squared_distances` are `float32`.
-For ragged queries, `query_offsets` must match the ragged source batch count.
-Each ragged source sample must contain at least `k` points.
+`indices` are `int64` local source indices. `squared_distances` are `float32`. For ragged queries, `query_offsets` must match the ragged source batch count. Each ragged source sample must contain at least `k` points.
 
-`source_points`, when provided, must match the source geometry shape and device.
-It is used only for gathering returned neighbor positions.
+`source_points`, when provided, must match the source geometry shape and device. It is used only for gathering returned neighbor positions.
 
-`sort_queries=True` uses the Morton-sorted traversal path for single and
-fixed-size batched handles. Ragged queries internally use the single-sample
-query path per sample.
+`sort_queries=True` uses the Morton-sorted traversal path for single and fixed-size batched handles. Ragged queries internally use the single-sample query path per sample.
 
 Exception boundaries:
 
 - Unsupported `k` raises `ValueError`.
-- Bad ranks, dimensions, dtype, device, offsets, or count mismatches raise
-  `ValueError`.
-- Wrong handle variants raise `TypeError`.
+- Bad ranks, dimensions, dtype, device, offsets, or count mismatches raise `ValueError`.
+- Unsupported handle types or `query_offsets` on a non-ragged handle raise `TypeError`.
 - Destroyed handles raise `RuntimeError`.
-
-### `query_knn_batched`
-
-```python
-query_knn_batched(
-    bvh: BatchedBVHHandle,
-    query_points: torch.Tensor,
-    k: int,
-    *,
-    source_points: torch.Tensor | None = None,
-    sort_queries: bool = True,
-)
-```
-
-Backward-compatible fixed-size batched query. Shapes and returns match the
-`BatchedBVHHandle` row in `query_knn(...)`.
-
-### `query_knn_ragged`
-
-```python
-query_knn_ragged(
-    bvh: RaggedBVHHandle,
-    query_points: torch.Tensor,
-    query_offsets: torch.Tensor,
-    k: int,
-    *,
-    source_points: torch.Tensor | None = None,
-)
-```
-
-Backward-compatible ragged query. Shapes and returns match the
-`RaggedBVHHandle` row in `query_knn(...)`.
 
 ## MLS Interpolation
 
@@ -277,39 +199,27 @@ Fixed-size batched shapes:
 - return: `(B, M, C)`
 - with `return_grad=True`: `((B, M, C), (B, M, D, C))`
 
-MLS requires `N >= k`, matching batch sizes and dimensions, and CUDA `float32`
-inputs on the same device. Non-contiguous `points`, `displaced_points`, and
-`features` are accepted and copied to contiguous layout internally only when
-needed.
+MLS requires `N >= k`, matching batch sizes and dimensions, and CUDA `float32` inputs on the same device. Non-contiguous `points`, `displaced_points`, and `features` are accepted and copied to contiguous layout internally only when needed. Feature channel count is unrestricted by the Python API; the CUDA route selects packed narrow-channel or cooperative wide-channel kernels internally.
 
-BVH construction and discrete neighbor selection are detached. PyTorch gradients
-flow through the MLS solve to `features` and `displaced_points`. They do not flow
-through BVH construction, neighbor indices, squared distances, or gathered
-neighbor positions.
+BVH construction and discrete neighbor selection are detached. PyTorch gradients flow through the MLS solve to `features` and `displaced_points`. They do not flow
+through BVH construction, neighbor indices, squared distances, or gathered neighbor positions. MLS custom autograd supports first-order gradients; higher-order differentiation is not supported.
 
-`return_grad=True` returns a spatial field-gradient tensor. It is ordinary
-operator output, not PyTorch autograd metadata. `return_grad=False` returns only
+`return_grad=True` returns a spatial field-gradient tensor. It is ordinary operator output, not PyTorch autograd metadata. `return_grad=False` returns only
 the interpolated tensor.
 
 Unsupported `k` and bad input contracts raise `ValueError`.
 
-### `bvh_mls_interpolate`
+### `bvh_mls_interpolate_batched_heads`
 
 ```python
-bvh_mls_interpolate(points, displaced_points, features, k=8, *, return_grad=False)
+bvh_mls_interpolate_batched_heads(
+    points, displaced_points, features, k=8, *, return_grad=False
+)
 ```
 
-Backward-compatible single-sample MLS function. Shapes and returns match the
-single-sample `mls_interpolate(...)` contract.
-
-### `bvh_mls_interpolate_batched`
-
-```python
-bvh_mls_interpolate_batched(points, displaced_points, features, k=8, *, return_grad=False)
-```
-
-Backward-compatible fixed-size batched MLS function. Shapes and returns match
-the batched `mls_interpolate(...)` contract.
+Matching-head MLS for `points: (B,N,D)`, queries `(B,M,H,D)`, and features
+`(B,N,H,C)`. It returns `(B,M,H,C)`, plus a `(B,M,H,D,C)` field gradient when
+`return_grad=True`.
 
 ### `conditional_mls_interpolate`
 
@@ -345,20 +255,12 @@ Input and output shapes:
 - branch queries: `(B, M, H, D)` CUDA `float32`.
 - branch features: `(B, N_branch, H, C)` CUDA `float32`.
 - output: `(B, M, H, C)`.
-- with `return_grad=True`: output plus spatial field gradient
-  `(B, M, H, D, C)`.
+- with `return_grad=True`: output plus spatial field gradient `(B, M, H, D, C)`.
 
-The branches must share `B`, `M`, `H`, `D`, `C`, dtype, and device, but
-`N_true` and `N_false` may differ. Each source count must be at least `k`.
-Inactive query rows are the explicit exception to the finite-input rule: they
-may contain NaNs because `torch.where` excludes them before BVH traversal.
+The branches must share `B`, `M`, `H`, `D`, `C`, dtype, and device, but `N_true` and `N_false` may differ. Each source count must be at least `k`.
+Inactive query rows are the explicit exception to the finite-input rule: they may contain NaNs because `torch.where` excludes them before BVH traversal.
 
-The operation builds two temporary point BVHs, route-sorts the selected queries,
-and performs one exact k-NN traversal and one MLS solve per query. Source
-positions and discrete selection are detached. Gradients flow to selected query
-rows and active source features; inactive query rows and inactive feature rows
-receive zero gradient. `mask` is non-differentiable.
-
+The operation builds two temporary point BVHs, route-sorts the selected queries, and performs one exact k-NN traversal and one MLS solve per query. Source positions and discrete selection are detached. Gradients flow to selected query rows and active source features; inactive query rows and inactive feature rows receive zero gradient. `mask` is non-differentiable.
 A boundary/field workflow keeps closest-hit ray tracing separate:
 
 ```python
@@ -377,8 +279,7 @@ values = torchbvh.conditional_mls_interpolate(
 
 ## Displaced-Query Helpers
 
-These helpers are for fixed-size batched, matching-head displaced queries. They
-build one BVH per batch sample over `pos` and flatten only query heads.
+These helpers are for fixed-size batched, matching-head displaced queries. They build one BVH per batch sample over `pos` and flatten only query heads.
 
 ### `query_displaced_knn`
 
@@ -404,8 +305,7 @@ Returns:
 - `squared_distances: (B, N, H, k)`.
 - `neighbor_positions: (B, N, H, k, D)` when `return_positions=True`.
 
-Outputs are detached from `pos` and `q`. Unsupported `k` or bad shapes, dtype,
-or device raise `ValueError`.
+Outputs are detached from `pos` and `q`. Unsupported `k` or bad shapes, dtype, or device raise `ValueError`.
 
 ### `gather_neighbor_values`
 
@@ -419,8 +319,7 @@ Gathers matching-head values from k-NN indices.
 - `indices: (B, N, H, k)` CUDA `int64` local source indices.
 - return: `(B, N, H, k, Ch)`.
 
-Indices must be in `[0, N)`. Gradients flow to `values` only. Contract
-violations raise `ValueError`.
+Indices must be in `[0, N)`. Gradients flow to `values` only. Contract violations raise `ValueError`.
 
 ### `interpolate_displaced`
 
@@ -437,15 +336,11 @@ interpolate_displaced(
 
 Interpolates matching-head values at displaced queries.
 
-Inputs follow `query_displaced_knn(...)` plus `values: (B, N, H, Ch)`. The return
-shape is `(B, N, H, Ch)`.
+Inputs follow `query_displaced_knn(...)` plus `values: (B, N, H, Ch)`. The return shape is `(B, N, H, Ch)`.
 
-The only supported reduction is `"weighted_mean"`. It uses inverse
-squared-distance weights. Exact hits use the unweighted mean over exact-hit
-neighbors. Any other reduction raises `ValueError`.
+The only supported reduction is `"weighted_mean"`. It uses inverse squared-distance weights. Exact hits use the unweighted mean over exact-hit neighbors. Any other reduction raises `ValueError`.
 
-Gradients flow to `values` only. They do not flow to `pos`, `q`, indices, or
-distances.
+Gradients flow to `values` only. They do not flow to `pos`, `q`, indices, or distances.
 
 ## FPS
 
@@ -473,20 +368,19 @@ Input shapes:
 - Single sample: `points: (N, D)`.
 - Fixed-size batch: `points: (B, N, D)`.
 
-`target_tokens` must be in `[1, N]`. `seed` must be `-1` or an original point
-index in `[0, N)`. `seed=-1` chooses the point nearest the input AABB center.
+`target_tokens` must be in `[1, N]`. `seed` must be `-1` or an original point index in `[0, N)`. `seed=-1` chooses the point nearest the input AABB center.
 
 Modes:
 
 - `"exact_bucketed"`: default exact path.
-- `"exact_full_scan"`: exact full-scan fallback.
 - `"approx_bucketed"`: opt-in approximate bucket-queue path.
 
 For `"approx_bucketed"`, `r` must be in `[1, 8]`, `c >= 1`, and `r * c <= 32`.
 `alpha` must be nonnegative. Invalid mode or knob values raise `ValueError`.
+When enabled, CUDA graph workspaces are scoped by device, caller stream, and workload shape. Concurrent calls on different streams therefore use independent storage.
+`use_graph=False` executes the same algorithm without graph replay.
 
-FPS is non-differentiable. It returns geometry and assignment metadata for use in
-user-owned pooling or unpooling logic.
+FPS is non-differentiable. It returns geometry and assignment metadata for use in user-owned pooling or unpooling logic.
 
 ### `FPSResult`
 
@@ -513,16 +407,16 @@ Single-sample result shapes:
 | `nearest_anchor_dist_sq` | `(N,)` | `float32` | squared distance to assigned anchor |
 | `anchor_radius` | `(M,)` | `float32` | max assigned squared distance per anchor |
 | `anchor_counts` | `(M,)` | `int32` | number of source points assigned per anchor |
-| `coarse_order` | `(M,)` | `int64` | permutation ordering anchors by BVH leaf position |
+| `coarse_order` | `(M,)` | `int64` | permutation ordering anchors by Morton position |
 | `selection_order_indices` | `(M,)` | `int64` | selected original indices in FPS selection order |
 
-Batched result shapes add a leading `B`: `indices: (B, M)`, `points:
-(B, M, D)`, assignment fields over source points as `(B, N)`, and anchor fields
-as `(B, M)`.
+Batched result shapes add a leading `B`:
+- `indices: (B, M)`, 
+- `points: (B, M, D)`, 
+- assignment fields over source points as `(B, N)`,
+- and anchor fields as `(B, M)`.
 
-`nearest_anchor` indexes anchors in selection order, not Morton order. To gather
-anchors in Morton order, first gather with `coarse_order` and remap assignments
-accordingly in user code.
+`nearest_anchor` indexes anchors in selection order, not Morton order. To gather anchors in Morton order, first gather with `coarse_order` and remap assignments accordingly in user code.
 
 ## Constants
 
@@ -533,9 +427,15 @@ SUPPORTED_DIMS = (2, 3)
 
 These constants record the public supported k-NN sizes and geometry dimensions.
 
-## Debug Helpers
+## Upgrading From 0.2.x
 
-The package also exports small arithmetic/debug symbols used by tests:
-`implicit_tree_ancestor`, `implicit_tree_descendant`, `implicit_tree_summary`,
-`morton_encode_2d`, `morton_encode_3d`, `morton_split2`, `morton_split3`, and
-`smoke_add_one`. They are not user-facing workflow APIs.
+Version 0.3.0 removes the 0.2.x deprecated aliases. Use `BVH` for single,
+fixed-size batched, and ragged objects; use `build_bvh`, `query_knn`, and
+`mls_interpolate` for procedural workflows. Pass `batch_offsets=` when building
+a ragged BVH and `query_offsets=` when querying it. Keep the handle returned by
+`build_bvh` rather than converting it to a plain dictionary.
+
+The distinct matching-head API, `bvh_mls_interpolate_batched_heads`, remains
+supported. The old `torchbvh.ops` module, detached query classes, and public
+debug/tree/Morton/smoke helpers are no longer exported. The FPS mode
+`mode="exact_full_scan"` remains unsupported.

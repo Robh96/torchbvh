@@ -4,10 +4,7 @@ This page describes the public algorithms behind `torchbvh` operations. It focus
 
 ## BVH Construction
 
-`torchbvh` builds an implicit bounding volume hierarchy over 2-D or 3-D points.
-The BVH layout follows the ostensibly-implicit tree formulation of Chitalu, Dubach, and
-Komura, and the Python/CUDA implementation was ported from the Julia
-`ImplicitBVH.jl` implementation.
+`torchbvh` builds an implicit bounding volume hierarchy over 2-D or 3-D points. The BVH layout follows the ostensibly-implicit tree formulation of Chitalu, Dubach, and Komura, and the Python/CUDA implementation was ported from the Julia `ImplicitBVH.jl` implementation.
 
 1. Compute the scene axis-aligned bounding box for the input points.
 2. Normalize each point into that scene box and assign it a Morton code.
@@ -19,8 +16,8 @@ Komura, and the Python/CUDA implementation was ported from the Julia
 
 Fixed-size batched BVHs repeat the same process independently for each sample in the batch. Ragged BVHs apply the same single-sample process to each packed segment described by `batch_offsets`.
 
-Why it is fast: The construction avoids serial tree insertion and pointer-heavy node allocation. Morton sorting converts spatial hierarchy construction into a parallel sort-plus-reduction problem, and the compact implicit tree stores only real node AABBs
-and source-index mappings. The main bottleneck in pointer or CPU tree builders is irregular allocation and recursive dependency; this design replaces it with contiguous tensor work that can be built and traversed with predictable memory access.
+Why it is fast: The construction avoids serial tree insertion and pointer-heavy node allocation. Morton sorting converts spatial hierarchy construction into a parallel sort-plus-reduction problem, and the compact implicit tree stores only real node AABBs and source-index mappings.
+The main bottleneck in pointer or CPU tree builders is irregular allocation and recursive dependency; this design replaces it with contiguous tensor work that can be built and traversed with predictable memory access.
 
 ## k-NN Query
 
@@ -45,23 +42,13 @@ Why it is fast: Brute-force k-NN evaluates every query against every source poin
 
 ## Closest-Hit Ray Tracing
 
-Primitive BVHs Morton-sort segment or triangle centers and store the complete
-primitive AABB at each leaf. Internal AABBs use the same implicit topology and
-bottom-up merge as point BVHs. Fixed-size batches build independently in one
-batched CUDA path.
+Primitive BVHs Morton-sort segment or triangle centers and store the complete primitive AABB at each leaf. Internal AABBs use the same implicit topology and bottom-up merge as point BVHs. Fixed-size batches build independently in one batched CUDA path.
 
-Traversal assigns one CUDA thread to each ray. A robust slab test produces the
-entry parameter for each node, the nearer child is visited first, and nodes
-beyond the current closest hit are pruned. Segment leaves solve the 2-D
-cross-product intersection equations; triangle leaves use double-sided
-Möller–Trumbore. Degenerate and non-unique parallel/collinear/coplanar cases are
-misses. Equal-distance hits select the lowest original primitive index.
+Traversal assigns one CUDA thread to each ray. A robust slab test produces the entry parameter for each node, the nearer child is visited first, and nodes beyond the current closest hit are pruned. 
+Segment leaves solve the 2-D cross-product intersection equations; triangle leaves use double-sided Möller–Trumbore. Degenerate and non-unique parallel/collinear/coplanar cases are misses. Equal-distance hits select the lowest original primitive index.
 
-For `B` samples, `F` primitives per sample, and `Q` rays per sample, building is
-`O(B F log F)` from Morton sorting and uses `O(B F)` storage. Traversal is
-typically `O(B Q log F)`, with the unavoidable worst case `O(B Q F)`, and uses
-`O(B Q)` output plus a fixed per-thread traversal stack. It never materializes
-an all-pairs `(B,Q,F,...)` tensor.
+For `B` samples, `F` primitives per sample, and `Q` rays per sample, building is `O(B F log F)` from Morton sorting and uses `O(B F)` storage. 
+Traversal is typically `O(B Q log F)`, with the unavoidable worst case `O(B Q F)`, and uses `O(B Q)` output plus a fixed per-thread traversal stack. It never materializes an all-pairs `(B,Q,F,...)` tensor.
 
 ## MLS Interpolation
 
@@ -80,38 +67,30 @@ For each displaced query point:
 8. Return the fitted constant term as the interpolated feature.
 9. When `return_grad=True`, return the fitted spatial slope as the field gradient.
 
-Gradients flow through the MLS solve to `features` and live `displaced_points`.
-Gradients do not flow through BVH construction, Morton sorting, k-NN selection, integer indices, squared distances, or detached neighbor positions.
+Gradients flow through the MLS solve to `features` and live `displaced_points`. Gradients do not flow through BVH construction, Morton sorting, k-NN selection, integer indices, squared distances, or detached neighbor positions.
 
-Why it is fast: a dense differentiable interpolation would either compare each query to all source points or build large intermediate tensors for weights and gradients. MLS uses the exact k-NN result to restrict the solve to `k` local samples, then solves only a
-small regularized linear system per query. The discrete geometry search is detached, so autograd tracks the continuous MLS solve for `features` and `displaced_points` without recording the BVH traversal, sorting, or integer neighbor selection.
+Why it is fast: a dense differentiable interpolation would either compare each query to all source points or build large intermediate tensors for weights and gradients. MLS uses the exact k-NN result to restrict the solve to `k` local samples, then solves only a small regularized linear system per query. The discrete geometry search is detached, so autograd tracks the continuous MLS solve for `features` and `displaced_points` without recording the BVH traversal, sorting, or integer neighbor selection.
 
 ### Conditional MLS Routing
 
-`conditional_mls_interpolate` avoids computing both MLS branches and selecting
-afterward. For `R = M * H` queries per sample it:
+`conditional_mls_interpolate` avoids computing both MLS branches and selecting afterward.
+For `R = M * H` queries per sample it:
 
 1. Selects the live query coordinates with `torch.where(mask, true, false)`.
 2. Flattens heads into the batched query dimension.
 3. Builds ordinary batched point BVHs for the two detached source geometries.
 4. Morton-encodes each query using the bounds of its selected branch.
-5. Places the route bit above the Morton bits and segmented-sorts the composite
-   key within each batch. This groups branches while retaining spatial locality.
-6. Runs one routed exact k-NN kernel. Each thread chooses one BVH and traverses
-   the shared closer-child-first search. False-branch indices are offset into the
-   concatenated source array.
-7. Gathers from concatenated detached positions and solves the existing fused
-   head-banked MLS once.
+5. Places the route bit above the Morton bits and segmented-sorts the composite key within each batch. This groups branches while retaining spatial locality.
+6. Runs one routed exact k-NN kernel. Each thread chooses one BVH and traverses the shared closer-child-first search. False-branch indices are offset into the concatenated source array.
+7. Loads indexed positions from the concatenated detached source bank inside the packed MLS kernel and solves each selected head-banked query once.
 
-There is no prefix scan, CPU synchronization, host-visible dynamic count, or
-Python loop over routes. Route-aware sorting is internal and unconditional.
-The fixed-width composite-key radix ordering is `O(B R)`. With `N_t` and `N_f`
-source points, construction is
-`O(B (N_t log N_t + N_f log N_f))`; typical traversal is
-`O(B R log(max(N_t,N_f)))`, with worst case
-`O(B R max(N_t,N_f))`. The local MLS work is `O(B R k)` for fixed spatial and
-feature dimensions. Storage is `O(B(N_t+N_f) + B R k)`, without an all-pairs
-query/source tensor.
+There is no prefix scan, CPU synchronization, host-visible dynamic count, or Python loop over routes. Route-aware sorting is internal and unconditional.
+The fixed-width composite-key radix ordering is `O(B R)`.
+With `N_t` and `N_f` source points, construction is `O(B (N_t log N_t + N_f log N_f))`;
+typical traversal is `O(B R log(max(N_t,N_f)))`,
+with worst case `O(B R max(N_t,N_f))`.
+The local MLS work is `O(B R k)` for fixed spatial and feature dimensions.
+Storage is `O(B(N_t+N_f) + B R k)`, without an all-pairs query/source tensor.
 
 ## FPS
 
@@ -125,7 +104,7 @@ All FPS modes maintain this state:
 
 ### Exact FPS
 
-The exact modes follow the standard farthest point sampling rule.
+The exact mode follows the standard farthest point sampling rule.
 
 1. Choose the first anchor from `seed`. If `seed=-1`, choose the source point nearest the input AABB center.
 2. Initialize every source point's nearest-anchor distance to its squared distance from the first anchor.
@@ -134,11 +113,9 @@ The exact modes follow the standard farthest point sampling rule.
 5. Repeat selection and update until `target_tokens` anchors have been selected.
 6. Gather selected anchor coordinates.
 7. Compute per-anchor assignment counts and per-anchor radius from the final nearest-anchor assignments.
-8. Compute `coarse_order`, which orders selected anchors by BVH leaf position for locality-aware downstream gathering.
+8. Compute `coarse_order`, which orders selected anchors by Morton position for locality-aware downstream gathering.
 
-`mode="exact_full_scan"` expresses this rule directly. `mode="exact_bucketed"` preserves the same exact result while using BVH/Morton bucket structure to organize the work.
-
-Why it is fast: standard exact FPS is dominated by the repeated global update and maximum search over all `N` points for each of `M` anchors. `exact_full_scan` keeps that state on the GPU and avoids CPU round trips. `exact_bucketed` keeps the exact selection rule but groups points by BVH/Morton buckets, so bucket maxima identify farthest candidates and AABB-based pruning can skip bucket refreshes that cannot improve any point's current nearest-anchor distance. This reduces memory traffic while preserving the exact FPS sequence.
+`mode="exact_bucketed"` preserves this exact result while using Morton buckets to organize the work. Bucket maxima identify farthest candidates, and AABB pruning can skip refreshes that cannot improve a point's current nearest-anchor distance. This reduces memory traffic while preserving the exact FPS sequence.
 
 ### Approximate Bucketed FPS
 

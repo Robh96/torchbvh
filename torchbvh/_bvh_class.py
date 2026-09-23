@@ -103,23 +103,3 @@ class BVH:
 
     def __exit__(self, *args) -> None:
         self.destroy()
-
-
-class BatchedBVH(BVH):
-    """Convenience subclass for fixed-size batched BVH. Equivalent to BVH(points) with (B, N, D) input."""
-
-    def __init__(self, points: torch.Tensor) -> None:
-        if points.dim() != 3:
-            raise ValueError("BatchedBVH: points must have shape (B, N, D)")
-        super().__init__(points)
-
-
-class RaggedBVH(BVH):
-    """Convenience subclass for ragged (variable-size) batched BVH.
-
-    Equivalent to BVH(points, batch_offsets=batch_offsets).
-    ``interpolate()`` raises ``TypeError``.
-    """
-
-    def __init__(self, points: torch.Tensor, batch_offsets: torch.Tensor) -> None:
-        super().__init__(points, batch_offsets=batch_offsets)

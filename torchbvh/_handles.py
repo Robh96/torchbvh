@@ -75,46 +75,26 @@ class RaggedBVHHandle(_MappingBVHHandle):
 
 def _bvh_data(bvh, prefix: str = "query_knn") -> Mapping:
     if isinstance(bvh, (BatchedBVHHandle, RaggedBVHHandle)):
-        raise TypeError(f"{prefix}: bvh must be a BVHHandle or mapping returned by build_bvh")
+        raise TypeError(f"{prefix}: bvh must be a BVHHandle returned by build_bvh")
     if isinstance(bvh, BVHHandle):
         return bvh._require_live()
-    if isinstance(bvh, Mapping):
-        if bvh.get("_destroyed", False):
-            raise RuntimeError("BVH handle has been destroyed")
-        if bvh.get("_batched", False) or bvh.get("_ragged", False) or "batch_size" in bvh:
-            raise TypeError(f"{prefix}: bvh must be a BVHHandle or mapping returned by build_bvh")
-        return bvh
-    raise TypeError(f"{prefix}: bvh must be a BVHHandle or mapping returned by build_bvh")
+    raise TypeError(f"{prefix}: bvh must be a BVHHandle returned by build_bvh")
 
 
-def _batched_bvh_data(bvh, prefix: str = "query_knn_batched") -> Mapping:
+def _batched_bvh_data(bvh, prefix: str = "query_knn") -> Mapping:
     if isinstance(bvh, BatchedBVHHandle):
         return bvh._require_live()
-    if isinstance(bvh, (BVHHandle, RaggedBVHHandle)):
-        raise TypeError(
-            f"{prefix}: bvh must be a BatchedBVHHandle or mapping returned by build_bvh_batched"
-        )
-    if isinstance(bvh, Mapping):
-        if bvh.get("_destroyed", False):
-            raise RuntimeError("Batched BVH handle has been destroyed")
-        if bvh.get("_ragged", False) or not (bvh.get("_batched", False) or "batch_size" in bvh):
-            raise TypeError(
-                f"{prefix}: bvh must be a BatchedBVHHandle or mapping returned by build_bvh_batched"
-            )
-        return bvh
-    raise TypeError(
-        f"{prefix}: bvh must be a BatchedBVHHandle or mapping returned by build_bvh_batched"
-    )
+    raise TypeError(f"{prefix}: bvh must be a BatchedBVHHandle returned by build_bvh")
 
 
-def _ragged_bvh_data(bvh, prefix: str = "query_knn_ragged") -> tuple[Mapping, list[BVHHandle]]:
+def _ragged_bvh_data(bvh, prefix: str = "query_knn") -> tuple[Mapping, list[BVHHandle]]:
     if isinstance(bvh, RaggedBVHHandle):
         return bvh._require_live(), bvh._require_handles()
     if isinstance(bvh, (BVHHandle, BatchedBVHHandle)):
         raise TypeError(
-            f"{prefix}: bvh must be a RaggedBVHHandle returned by build_bvh_ragged"
+            f"{prefix}: bvh must be a RaggedBVHHandle returned by build_bvh"
         )
-    raise TypeError(f"{prefix}: bvh must be a RaggedBVHHandle returned by build_bvh_ragged")
+    raise TypeError(f"{prefix}: bvh must be a RaggedBVHHandle returned by build_bvh")
 
 
 @contextmanager
@@ -126,7 +106,7 @@ def _temporary_bvh(build_fn, points: torch.Tensor):
         destroy_bvh(handle)
 
 
-def destroy_bvh(bvh: BVHHandle | Mapping) -> None:
+def destroy_bvh(bvh: BVHHandle | BatchedBVHHandle | RaggedBVHHandle) -> None:
     """Destroy a Python BVH handle and release its tensor references."""
     if isinstance(bvh, RaggedBVHHandle):
         bvh.destroy()
@@ -137,8 +117,4 @@ def destroy_bvh(bvh: BVHHandle | Mapping) -> None:
     if isinstance(bvh, BVHHandle):
         bvh.destroy()
         return
-    if isinstance(bvh, dict):
-        bvh.clear()
-        bvh["_destroyed"] = True
-        return
-    raise TypeError("destroy_bvh: bvh must be a BVHHandle or dict returned by build_bvh")
+    raise TypeError("destroy_bvh: bvh must be a handle returned by build_bvh")

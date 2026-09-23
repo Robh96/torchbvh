@@ -5,6 +5,7 @@
 #include <torch/types.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -39,127 +40,6 @@ __device__ inline float point_distance_sq(
 
 
 
-
-template <int D, int THREADS>
-__global__ void fps_exact_full_scan_kernel(
-    const float* __restrict__ points,
-    const int64_t* __restrict__ seed_indices,
-    int64_t* __restrict__ fps_idx,
-    int* __restrict__ nearest_anchor,
-    float* __restrict__ nearest_dist_sq,
-    int N,
-    int M
-) {
-    const int b = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int64_t point_base = static_cast<int64_t>(b) * N * D;
-    const int64_t state_base = static_cast<int64_t>(b) * N;
-    const int seed = static_cast<int>(seed_indices[b]);
-    const int lane = tid & 31;
-    const int warp_id = tid >> 5;
-
-    __shared__ float warp_dist[THREADS / 32];
-    __shared__ int warp_idx[THREADS / 32];
-    __shared__ int anchor_idx;
-
-    if (tid == 0) {
-        fps_idx[static_cast<int64_t>(b) * M] = seed;
-    }
-    for (int i = tid; i < N; i += THREADS) {
-        nearest_dist_sq[state_base + i] = point_distance_sq<D>(points, point_base, i, seed);
-        nearest_anchor[state_base + i] = 0;
-    }
-    __syncthreads();
-
-    for (int round_idx = 1; round_idx < M; ++round_idx) {
-        float best_dist = -1.0f;
-        int best_idx = 0;
-        for (int i = tid; i < N; i += THREADS) {
-            const float value = nearest_dist_sq[state_base + i];
-            if (value > best_dist || (value == best_dist && i < best_idx)) {
-                best_dist = value;
-                best_idx = i;
-            }
-        }
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other_dist = __shfl_down_sync(0xffffffff, best_dist, offset);
-            const int other_idx = __shfl_down_sync(0xffffffff, best_idx, offset);
-            if (other_dist > best_dist || (other_dist == best_dist && other_idx < best_idx)) {
-                best_dist = other_dist;
-                best_idx = other_idx;
-            }
-        }
-        if (lane == 0) {
-            warp_dist[warp_id] = best_dist;
-            warp_idx[warp_id] = best_idx;
-        }
-        __syncthreads();
-
-        if (warp_id == 0) {
-            best_dist = (lane < THREADS / 32) ? warp_dist[lane] : -1.0f;
-            best_idx = (lane < THREADS / 32) ? warp_idx[lane] : 0;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other_dist = __shfl_down_sync(0xffffffff, best_dist, offset);
-                const int other_idx = __shfl_down_sync(0xffffffff, best_idx, offset);
-                if (other_dist > best_dist || (other_dist == best_dist && other_idx < best_idx)) {
-                    best_dist = other_dist;
-                    best_idx = other_idx;
-                }
-            }
-            if (lane == 0) {
-                anchor_idx = best_idx;
-                fps_idx[static_cast<int64_t>(b) * M + round_idx] = static_cast<int64_t>(best_idx);
-            }
-        }
-        __syncthreads();
-
-        for (int i = tid; i < N; i += THREADS) {
-            const float d_new = point_distance_sq<D>(points, point_base, i, anchor_idx);
-            float& current = nearest_dist_sq[state_base + i];
-            if (d_new < current) {
-                current = d_new;
-                nearest_anchor[state_base + i] = round_idx;
-            }
-        }
-        __syncthreads();
-    }
-}
-
-
-
-
-
-template <int D>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_exact_full_scan_impl(
-    torch::Tensor points,
-    torch::Tensor seed_indices,
-    int M
-) {
-    const int B = static_cast<int>(points.size(0));
-    const int N = static_cast<int>(points.size(1));
-    auto fps_idx = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt64));
-    auto nearest_anchor = torch::empty({B, N}, seed_indices.options().dtype(torch::kInt32));
-    auto nearest_dist_sq = torch::empty({B, N}, points.options());
-
-    constexpr int threads = 256;
-    fps_exact_full_scan_kernel<D, threads><<<B, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        points.data_ptr<float>(),
-        seed_indices.data_ptr<int64_t>(),
-        fps_idx.data_ptr<int64_t>(),
-        nearest_anchor.data_ptr<int>(),
-        nearest_dist_sq.data_ptr<float>(),
-        N,
-        M
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return std::make_tuple(fps_idx, nearest_anchor, nearest_dist_sq);
-}
-
-// ---------------------------------------------------------------------------
-// Metadata helpers shared by maintained FPS routes
-// ---------------------------------------------------------------------------
 
 __global__ void fps_metadata_scatter_kernel(
     const int* __restrict__ nearest_anchor,
@@ -348,8 +228,9 @@ struct BucketQueueWorkspaceKey {
     int max_commit_per_iteration;
     int candidates_per_round;
     int anchors_per_round;
-    int top_risk_buckets;
     int threads_per_block;
+    int device_index;
+    std::uintptr_t caller_stream;
 
     bool operator==(const BucketQueueWorkspaceKey& o) const noexcept {
         return B==o.B && N==o.N && D==o.D && M==o.M
@@ -360,8 +241,9 @@ struct BucketQueueWorkspaceKey {
             && max_commit_per_iteration==o.max_commit_per_iteration
             && candidates_per_round==o.candidates_per_round
             && anchors_per_round==o.anchors_per_round
-            && top_risk_buckets==o.top_risk_buckets
-            && threads_per_block==o.threads_per_block;
+            && threads_per_block==o.threads_per_block
+            && device_index==o.device_index
+            && caller_stream==o.caller_stream;
     }
 };
 
@@ -373,8 +255,10 @@ struct BucketQueueWorkspaceKeyHash {
         mix(k.bucket_count); mix(k.effective_refresh_interval);
         mix(k.dirty_refresh_interval); mix(k.max_iterations);
         mix(k.max_commit_per_iteration); mix(k.candidates_per_round);
-        mix(k.anchors_per_round); mix(k.top_risk_buckets);
-        mix(k.threads_per_block);
+        mix(k.anchors_per_round);
+        mix(k.threads_per_block); mix(k.device_index);
+        h ^= std::hash<std::uintptr_t>{}(k.caller_stream)
+            + 0x9e3779b9 + (h<<6) + (h>>2);
         return h;
     }
 };
@@ -386,14 +270,13 @@ struct BucketQueueWorkspace {
     torch::Tensor selected_flags, selected_counts;
     torch::Tensor bucket_leaf_begin, bucket_leaf_end, bucket_last_applied;
     torch::Tensor bucket_max_dist_sq, bucket_max_leaf, bucket_aabb, dirty_flags;
-    torch::Tensor mode_flags, visited_leaf_counts, committed_counts;
-    torch::Tensor candidate_counts, rejected_counts, refresh_flags;
 
     cudaStream_t ws_stream = nullptr;
     cudaEvent_t ws_input_ready = nullptr;
     cudaEvent_t ws_output_ready = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
+    std::mutex enqueue_mutex;
 
     ~BucketQueueWorkspace() {
         if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
@@ -583,7 +466,7 @@ __global__ void fps_mark_dirty_aabb_kernel(
     }
 }
 
-template <int THREADS, int MAX_CANDIDATES, int MAX_R>
+template <int THREADS, int MAX_CANDIDATES>
 __global__ void fps_bucket_queue_select_kernel(
     const int64_t* __restrict__ sorted_indices,
     const float* __restrict__ bucket_max_dist_sq,
@@ -591,28 +474,18 @@ __global__ void fps_bucket_queue_select_kernel(
     int64_t* __restrict__ fps_idx,
     int* __restrict__ selected_flags,
     int* __restrict__ selected_counts,
-    int* __restrict__ mode_flags,
-    int* __restrict__ visited_leaf_counts,
-    int* __restrict__ committed_counts,
-    int* __restrict__ candidate_counts,
-    int* __restrict__ rejected_counts,
-    int* __restrict__ dirty_flags,
     int B,
     int N,
     int M,
     int bucket_count,
     int candidates_per_round,
     int anchors_per_round,
-    int top_risk_buckets,
-    float alpha,
-    int stat_slot
+    float alpha
 ) {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp_id = tid >> 5;
-    (void)dirty_flags;
-    (void)top_risk_buckets;
     if (b >= B || selected_counts[b] >= M) {
         return;
     }
@@ -705,21 +578,16 @@ __global__ void fps_bucket_queue_select_kernel(
     if (tid == 0) {
         int count = selected_counts[b];
         int commits = 0;
-        int rejects = 0;
-        int candidates = 0;
         const float reject_threshold = alpha * alpha * max(0.0f, cand_dist[0]);
         for (int slot = 0; slot < candidates_per_round && commits < anchors_per_round && count < M; ++slot) {
             const int original = cand_original[slot];
             if (original < 0 || original >= N) {
                 continue;
             }
-            candidates += 1;
             if (selected_flags[static_cast<int64_t>(b) * N + original] != 0) {
-                rejects += 1;
                 continue;
             }
             if (alpha > 0.0f && cand_dist[slot] <= reject_threshold && count + anchors_per_round < M) {
-                rejects += 1;
                 continue;
             }
             fps_idx[static_cast<int64_t>(b) * M + count] = static_cast<int64_t>(original);
@@ -728,12 +596,6 @@ __global__ void fps_bucket_queue_select_kernel(
             commits += 1;
         }
         selected_counts[b] = count;
-        const int64_t stat_idx = static_cast<int64_t>(b) * M + min(stat_slot, M - 1);
-        mode_flags[stat_idx] = 3;
-        visited_leaf_counts[stat_idx] = bucket_count;
-        committed_counts[stat_idx] = commits;
-        candidate_counts[stat_idx] = candidates;
-        rejected_counts[stat_idx] = rejects;
     }
 }
 
@@ -752,13 +614,11 @@ __global__ void fps_bucket_queue_refresh_kernel(
     float* __restrict__ bucket_max_dist_sq,
     int* __restrict__ bucket_max_leaf,
     int* __restrict__ dirty_flags,
-    int* __restrict__ refresh_flags,
     int B,
     int N,
     int M,
     int bucket_count,
-    bool force_refresh,
-    int stat_slot
+    bool force_refresh
 ) {
     const int b = blockIdx.y;
     const int bucket = blockIdx.x;
@@ -831,9 +691,6 @@ __global__ void fps_bucket_queue_refresh_kernel(
         bucket_max_dist_sq[bucket_idx] = shared_dist[0];
         bucket_max_leaf[bucket_idx] = shared_leaf[0];
         dirty_flags[bucket_idx] = 0;
-        if (bucket == 0) {
-            refresh_flags[static_cast<int64_t>(b) * M + min(stat_slot, M - 1)] = 1;
-        }
     }
 }
 
@@ -890,7 +747,9 @@ __global__ void fps_exact_bucketed_init_kernel(
         const int64_t count_idx = (count_stride == 0)
             ? static_cast<int64_t>(b)
             : static_cast<int64_t>(b) * count_stride;
-        atomicAdd(refreshed_counts + count_idx, 1);
+        if (refreshed_counts != nullptr) {
+            atomicAdd(refreshed_counts + count_idx, 1);
+        }
     }
 
     const int seed = static_cast<int>(seed_indices[b]);
@@ -1085,7 +944,9 @@ __global__ void fps_exact_bucketed_refresh_kernel(
                 const int64_t count_idx = (count_stride == 0)
                     ? static_cast<int64_t>(b)
                     : static_cast<int64_t>(b) * count_stride + round_idx;
-                atomicAdd(skipped_counts + count_idx, 1);
+                if (skipped_counts != nullptr) {
+                    atomicAdd(skipped_counts + count_idx, 1);
+                }
             }
             return;
         }
@@ -1141,74 +1002,17 @@ __global__ void fps_exact_bucketed_refresh_kernel(
         const int64_t count_idx = (count_stride == 0)
             ? static_cast<int64_t>(b)
             : static_cast<int64_t>(b) * count_stride + round_idx;
-        atomicAdd(refreshed_counts + count_idx, 1);
-    }
-}
-
-template <int D>
-__device__ inline float original_point_distance_sq(
-    const float* __restrict__ points,
-    int64_t point_base,
-    int i,
-    int j
-) {
-    float dist = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < D; ++d) {
-        const float delta = points[point_base + static_cast<int64_t>(i) * D + d]
-            - points[point_base + static_cast<int64_t>(j) * D + d];
-        dist += delta * delta;
-    }
-    return dist;
-}
-
-__device__ inline int fps_walk_max_leaf_from_mem(
-    const float* __restrict__ sample_node_max,
-    const int* __restrict__ left_child_mem,
-    const int* __restrict__ right_child_mem,
-    const int* __restrict__ mem_to_leaf,
-    int root_mem
-) {
-    int mem_idx = root_mem;
-    while (left_child_mem[mem_idx] != -1) {
-        const int left = left_child_mem[mem_idx];
-        const int right = right_child_mem[mem_idx];
-        if (right != -1 && sample_node_max[right] > sample_node_max[left]) {
-            mem_idx = right;
-        } else {
-            mem_idx = left;
+        if (refreshed_counts != nullptr) {
+            atomicAdd(refreshed_counts + count_idx, 1);
         }
     }
-    return mem_to_leaf[mem_idx];
 }
 
-
-
-
-
-
-
 template <int D>
-std::tuple<
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor
-> fps_approx_bucketed_impl(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_approx_bucketed_impl(
     torch::Tensor points,
     torch::Tensor seed_indices,
     torch::Tensor sorted_indices,
-    torch::Tensor left_child_mem,
-    torch::Tensor right_child_mem,
-    torch::Tensor mem_to_leaf,
-    torch::Tensor node_aabbs,
-    int num_real_nodes,
     int leaf_level,
     int M,
     int bucket_size,
@@ -1218,12 +1022,6 @@ std::tuple<
     float alpha,
     bool use_graph
 ) {
-    (void)left_child_mem;
-    (void)right_child_mem;
-    (void)mem_to_leaf;
-    (void)node_aabbs;
-    (void)num_real_nodes;
-    (void)refresh_interval;
 
     const int B = static_cast<int>(points.size(0));
     const int N = static_cast<int>(points.size(1));
@@ -1244,8 +1042,6 @@ std::tuple<
         }
     }
     const int bucket_count = implicit_bvh::tree::real_nodes_at_level(N, bucket_level);
-    const int min_bucket_size = N / bucket_count;
-    const int max_bucket_size = (N + bucket_count - 1) / bucket_count;
     const int max_commit_per_iteration = min(anchors_per_round, bucket_count);
     const int max_iterations = (M <= 1) ? 0 : ((M - 1 + max_commit_per_iteration - 1) / max_commit_per_iteration);
     const int bucket_round_capacity = max(1, bucket_count / anchors_per_round);
@@ -1256,17 +1052,17 @@ std::tuple<
     if (use_graph) {
         constexpr int _threads = 256;
         constexpr int _max_candidates = 32;
-        constexpr int _max_r = 8;
-        const int _top_risk_buckets = min(candidates_per_round, max(anchors_per_round, anchors_per_round * 2));
         const dim3 _bucket_blocks(bucket_count, B);
         const int64_t _total_pts = static_cast<int64_t>(B) * N;
         const int _scatter_blocks = static_cast<int>((_total_pts + _threads - 1) / _threads);
 
+        cudaStream_t _main_stream = at::cuda::getCurrentCUDAStream().stream();
         const BucketQueueWorkspaceKey _key{
             B, N, D, M, bucket_count,
             effective_refresh_interval, dirty_refresh_interval,
             max_iterations, max_commit_per_iteration,
-            candidates_per_round, anchors_per_round, _top_risk_buckets, _threads
+            candidates_per_round, anchors_per_round, _threads,
+            points.get_device(), reinterpret_cast<std::uintptr_t>(_main_stream)
         };
 
         std::shared_ptr<BucketQueueWorkspace> _ws;
@@ -1294,12 +1090,6 @@ std::tuple<
                 _ws->bucket_max_leaf    = torch::empty({B, bucket_count}, seed_indices.options().dtype(torch::kInt32));
                 _ws->bucket_aabb        = torch::empty({B, bucket_count, 2 * D}, points.options());
                 _ws->dirty_flags        = torch::empty({B, bucket_count}, seed_indices.options().dtype(torch::kInt32));
-                _ws->mode_flags         = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
-                _ws->visited_leaf_counts = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
-                _ws->committed_counts   = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
-                _ws->candidate_counts   = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
-                _ws->rejected_counts    = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
-                _ws->refresh_flags      = torch::empty({B, M}, seed_indices.options().dtype(torch::kInt32));
                 // Dedicated non-null stream for graph capture/replay
                 C10_CUDA_CHECK(cudaStreamCreateWithFlags(&_ws->ws_stream, cudaStreamNonBlocking));
                 C10_CUDA_CHECK(cudaEventCreateWithFlags(&_ws->ws_input_ready, cudaEventDisableTiming));
@@ -1308,10 +1098,10 @@ std::tuple<
             }
         }
 
+        std::lock_guard<std::mutex> _enqueue_lock(_ws->enqueue_mutex);
         // Input copies on the main (ATen) stream, which may be the null/legacy-default stream.
         // Using raw cudaMemcpyAsync avoids any PyTorch stream bookkeeping that could interfere
         // with capture mode on the dedicated workspace stream below.
-        cudaStream_t _main_stream = at::cuda::getCurrentCUDAStream().stream();
         C10_CUDA_CHECK(cudaMemcpyAsync(
             _ws->ws_points.data_ptr(),
             points.data_ptr(),
@@ -1341,12 +1131,6 @@ std::tuple<
             // Zero-initialize tensors that must start as zero on every call.
             C10_CUDA_CHECK(cudaMemsetAsync(_ws->selected_flags.data_ptr(),      0, static_cast<size_t>(B) * N            * sizeof(int), _ws->ws_stream));
             C10_CUDA_CHECK(cudaMemsetAsync(_ws->dirty_flags.data_ptr(),         0, static_cast<size_t>(B) * bucket_count  * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->mode_flags.data_ptr(),          0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->visited_leaf_counts.data_ptr(), 0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->committed_counts.data_ptr(),    0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->candidate_counts.data_ptr(),    0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->rejected_counts.data_ptr(),     0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(_ws->refresh_flags.data_ptr(),       0, static_cast<size_t>(B) * M            * sizeof(int), _ws->ws_stream));
             C10_CUDA_CHECK(cudaMemsetAsync(_ws->fps_idx.data_ptr(),            0, static_cast<size_t>(B) * M            * sizeof(int64_t), _ws->ws_stream));
 
             fps_bucket_queue_init_kernel<D, _threads><<<_bucket_blocks, _threads, 0, _ws->ws_stream>>>(
@@ -1368,24 +1152,16 @@ std::tuple<
             );
 
             for (int _iter = 0; _iter < max_iterations; ++_iter) {
-                const int _stat_slot = 1 + _iter * max_commit_per_iteration;
                 const int _committed_start = 1 + _iter * max_commit_per_iteration;
-                fps_bucket_queue_select_kernel<_threads, _max_candidates, _max_r><<<B, _threads, 0, _ws->ws_stream>>>(
+                fps_bucket_queue_select_kernel<_threads, _max_candidates><<<B, _threads, 0, _ws->ws_stream>>>(
                     _ws->ws_sorted_indices.data_ptr<int64_t>(),
                     _ws->bucket_max_dist_sq.data_ptr<float>(),
                     _ws->bucket_max_leaf.data_ptr<int>(),
                     _ws->fps_idx.data_ptr<int64_t>(),
                     _ws->selected_flags.data_ptr<int>(),
                     _ws->selected_counts.data_ptr<int>(),
-                    _ws->mode_flags.data_ptr<int>(),
-                    _ws->visited_leaf_counts.data_ptr<int>(),
-                    _ws->committed_counts.data_ptr<int>(),
-                    _ws->candidate_counts.data_ptr<int>(),
-                    _ws->rejected_counts.data_ptr<int>(),
-                    _ws->dirty_flags.data_ptr<int>(),
                     B, N, M, bucket_count,
-                    candidates_per_round, anchors_per_round, _top_risk_buckets,
-                    alpha, _stat_slot
+                    candidates_per_round, anchors_per_round, alpha
                 );
 
                 fps_mark_dirty_aabb_kernel<D, _threads><<<_bucket_blocks, _threads, 0, _ws->ws_stream>>>(
@@ -1417,8 +1193,7 @@ std::tuple<
                         _ws->bucket_max_dist_sq.data_ptr<float>(),
                         _ws->bucket_max_leaf.data_ptr<int>(),
                         _ws->dirty_flags.data_ptr<int>(),
-                        _ws->refresh_flags.data_ptr<int>(),
-                        B, N, M, bucket_count, _force_refresh, _stat_slot
+                        B, N, M, bucket_count, _force_refresh
                     );
                 }
             }
@@ -1442,40 +1217,11 @@ std::tuple<
         C10_CUDA_CHECK(cudaStreamWaitEvent(_main_stream, _ws->ws_output_ready, 0));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // Build bucket_info on the CPU (outside the graph) and copy to device.
-        auto _bucket_info = torch::empty({16}, seed_indices.options().dtype(torch::kInt32));
-        auto _bucket_info_cpu = torch::empty({16}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-        auto* _info = _bucket_info_cpu.data_ptr<int>();
-        _info[0]  = bucket_level;
-        _info[1]  = bucket_count;
-        _info[2]  = min_bucket_size;
-        _info[3]  = max_bucket_size;
-        _info[4]  = bucket_size;
-        _info[5]  = refresh_interval;
-        _info[6]  = candidates_per_round;
-        _info[7]  = anchors_per_round;
-        _info[8]  = max_iterations;
-        _info[9]  = bucket_count * ((max_iterations + effective_refresh_interval - 1) / effective_refresh_interval);
-        _info[10] = 0;
-        _info[11] = _top_risk_buckets;
-        _info[12] = dirty_refresh_interval;
-        _info[13] = 0;
-        _info[14] = 0;
-        _info[15] = 2;
-        _bucket_info.copy_(_bucket_info_cpu, false);
-
         // Clone workspace outputs so each caller gets independent tensors.
         return std::make_tuple(
             _ws->fps_idx.clone(),
             _ws->nearest_anchor.clone(),
-            _ws->nearest_dist_sq.clone(),
-            _ws->mode_flags.clone(),
-            _ws->visited_leaf_counts.clone(),
-            _ws->committed_counts.clone(),
-            _ws->candidate_counts.clone(),
-            _ws->rejected_counts.clone(),
-            _ws->refresh_flags.clone(),
-            _bucket_info
+            _ws->nearest_dist_sq.clone()
         );
     }
     // === END CUDA GRAPH PATH ===
@@ -1496,17 +1242,8 @@ std::tuple<
     auto bucket_aabb = torch::empty({B, bucket_count, 2 * D}, points.options());
     auto dirty_flags = torch::zeros({B, bucket_count}, seed_indices.options().dtype(torch::kInt32));
 
-    auto mode_flags = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-    auto visited_leaf_counts = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-    auto committed_counts = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-    auto candidate_counts = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-    auto rejected_counts = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-    auto refresh_flags = torch::zeros({B, M}, seed_indices.options().dtype(torch::kInt32));
-
     constexpr int threads = 256;
     constexpr int max_candidates = 32;
-    constexpr int max_r = 8;
-    const int top_risk_buckets = min(candidates_per_round, max(anchors_per_round, anchors_per_round * 2));
     const dim3 bucket_blocks(bucket_count, B);
     fps_bucket_queue_init_kernel<D, threads><<<bucket_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         points.data_ptr<float>(),
@@ -1533,30 +1270,21 @@ std::tuple<
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     for (int iter = 0; iter < max_iterations; ++iter) {
-        const int stat_slot = 1 + iter * max_commit_per_iteration;
         const int committed_start = 1 + iter * max_commit_per_iteration;
-        fps_bucket_queue_select_kernel<threads, max_candidates, max_r><<<B, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        fps_bucket_queue_select_kernel<threads, max_candidates><<<B, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
             sorted_indices.data_ptr<int64_t>(),
             bucket_max_dist_sq.data_ptr<float>(),
             bucket_max_leaf.data_ptr<int>(),
             fps_idx.data_ptr<int64_t>(),
             selected_flags.data_ptr<int>(),
             selected_counts.data_ptr<int>(),
-            mode_flags.data_ptr<int>(),
-            visited_leaf_counts.data_ptr<int>(),
-            committed_counts.data_ptr<int>(),
-            candidate_counts.data_ptr<int>(),
-            rejected_counts.data_ptr<int>(),
-            dirty_flags.data_ptr<int>(),
             B,
             N,
             M,
             bucket_count,
             candidates_per_round,
             anchors_per_round,
-            top_risk_buckets,
-            alpha,
-            stat_slot
+            alpha
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -1590,13 +1318,11 @@ std::tuple<
                 bucket_max_dist_sq.data_ptr<float>(),
                 bucket_max_leaf.data_ptr<int>(),
                 dirty_flags.data_ptr<int>(),
-                refresh_flags.data_ptr<int>(),
                 B,
                 N,
                 M,
                 bucket_count,
-                force_refresh,
-                stat_slot
+                force_refresh
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
@@ -1615,39 +1341,7 @@ std::tuple<
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    auto bucket_info = torch::empty({16}, seed_indices.options().dtype(torch::kInt32));
-    auto bucket_info_cpu = torch::empty({16}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-    auto* info = bucket_info_cpu.data_ptr<int>();
-    info[0] = bucket_level;
-    info[1] = bucket_count;
-    info[2] = min_bucket_size;
-    info[3] = max_bucket_size;
-    info[4] = bucket_size;
-    info[5] = refresh_interval;
-    info[6] = candidates_per_round;
-    info[7] = anchors_per_round;
-    info[8] = max_iterations;
-    info[9] = bucket_count * ((max_iterations + effective_refresh_interval - 1) / effective_refresh_interval);
-    info[10] = 0;
-    info[11] = top_risk_buckets;
-    info[12] = dirty_refresh_interval;
-    info[13] = 0;
-    info[14] = 0;
-    info[15] = 2;
-    bucket_info.copy_(bucket_info_cpu, false);
-
-    return std::make_tuple(
-        fps_idx,
-        nearest_anchor,
-        nearest_dist_sq,
-        mode_flags,
-        visited_leaf_counts,
-        committed_counts,
-        candidate_counts,
-        rejected_counts,
-        refresh_flags,
-        bucket_info
-    );
+    return std::make_tuple(fps_idx, nearest_anchor, nearest_dist_sq);
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,6 +1355,7 @@ struct ExactBucketedWorkspaceKey {
     int enable_pruning;
     int threads_per_block;
     int device_index;
+    std::uintptr_t caller_stream;
 
     bool operator==(const ExactBucketedWorkspaceKey& o) const noexcept {
         return B==o.B && N==o.N && D==o.D && M==o.M
@@ -1668,7 +1363,8 @@ struct ExactBucketedWorkspaceKey {
             && bucket_size==o.bucket_size
             && enable_pruning==o.enable_pruning
             && threads_per_block==o.threads_per_block
-            && device_index==o.device_index;
+            && device_index==o.device_index
+            && caller_stream==o.caller_stream;
     }
 };
 
@@ -1680,6 +1376,8 @@ struct ExactBucketedWorkspaceKeyHash {
         mix(k.bucket_count); mix(k.bucket_size);
         mix(k.enable_pruning); mix(k.threads_per_block);
         mix(k.device_index);
+        h ^= std::hash<std::uintptr_t>{}(k.caller_stream)
+            + 0x9e3779b9 + (h<<6) + (h>>2);
         return h;
     }
 };
@@ -1690,13 +1388,15 @@ struct ExactBucketedWorkspace {
     torch::Tensor leaf_nearest_anchor, leaf_nearest_dist_sq;
     torch::Tensor bucket_leaf_begin, bucket_leaf_end;
     torch::Tensor bucket_max_dist_sq, bucket_max_leaf, bucket_aabb;
-    torch::Tensor refreshed_counts, skipped_counts;
 
     cudaStream_t ws_stream = nullptr;
     cudaEvent_t ws_input_ready = nullptr;
     cudaEvent_t ws_output_ready = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
+    // Keep host threads targeting the same caller stream from interleaving
+    // workspace copies, graph launch, and output clones.
+    std::mutex enqueue_mutex;
 
     ~ExactBucketedWorkspace() {
         if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
@@ -1715,35 +1415,16 @@ static std::unordered_map<
 static std::mutex s_exact_bucketed_workspace_mutex;
 
 template <int D>
-std::tuple<
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor
-> fps_exact_bucketed_impl(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_exact_bucketed_impl(
     torch::Tensor points,
     torch::Tensor seed_indices,
     torch::Tensor sorted_indices,
-    torch::Tensor left_child_mem,
-    torch::Tensor right_child_mem,
-    torch::Tensor mem_to_leaf,
-    torch::Tensor node_aabbs,
-    int num_real_nodes,
     int leaf_level,
     int M,
     int bucket_size,
     bool use_graph,
     bool enable_pruning
 ) {
-    (void)left_child_mem;
-    (void)right_child_mem;
-    (void)mem_to_leaf;
-    (void)node_aabbs;
-    (void)num_real_nodes;
-    (void)use_graph;
-
     const int B = static_cast<int>(points.size(0));
     const int N = static_cast<int>(points.size(1));
     TORCH_CHECK(bucket_size >= 1, "fps_exact_bucketed: bucket_size must be >= 1");
@@ -1757,8 +1438,6 @@ std::tuple<
         }
     }
     const int bucket_count = implicit_bvh::tree::real_nodes_at_level(N, bucket_level);
-    const int min_bucket_size = N / bucket_count;
-    const int max_bucket_size = (N + bucket_count - 1) / bucket_count;
 
     auto idx_options = seed_indices.options().dtype(torch::kInt64);
     auto i32_options = seed_indices.options().dtype(torch::kInt32);
@@ -1770,9 +1449,11 @@ std::tuple<
     const int scatter_blocks = static_cast<int>((total + threads - 1) / threads);
 
     if (use_graph) {
+        cudaStream_t main_stream = at::cuda::getCurrentCUDAStream().stream();
         const ExactBucketedWorkspaceKey key{
             B, N, D, M, bucket_count, bucket_size, enable_pruning ? 1 : 0,
-            threads, points.get_device()
+            threads, points.get_device(),
+            reinterpret_cast<std::uintptr_t>(main_stream)
         };
 
         std::shared_ptr<ExactBucketedWorkspace> ws;
@@ -1796,8 +1477,6 @@ std::tuple<
                 ws->bucket_max_dist_sq = torch::empty({B, bucket_count}, f_options);
                 ws->bucket_max_leaf = torch::empty({B, bucket_count}, i32_options);
                 ws->bucket_aabb = torch::empty({B, bucket_count, 2 * D}, f_options);
-                ws->refreshed_counts = torch::empty({B}, i32_options);
-                ws->skipped_counts = torch::empty({B}, i32_options);
                 C10_CUDA_CHECK(cudaStreamCreateWithFlags(&ws->ws_stream, cudaStreamNonBlocking));
                 C10_CUDA_CHECK(cudaEventCreateWithFlags(&ws->ws_input_ready, cudaEventDisableTiming));
                 C10_CUDA_CHECK(cudaEventCreateWithFlags(&ws->ws_output_ready, cudaEventDisableTiming));
@@ -1805,7 +1484,7 @@ std::tuple<
             }
         }
 
-        cudaStream_t main_stream = at::cuda::getCurrentCUDAStream().stream();
+        std::lock_guard<std::mutex> enqueue_lock(ws->enqueue_mutex);
         C10_CUDA_CHECK(cudaMemcpyAsync(
             ws->ws_points.data_ptr(),
             points.data_ptr(),
@@ -1828,8 +1507,6 @@ std::tuple<
             C10_CUDA_CHECK(cudaStreamSynchronize(ws->ws_stream));
             C10_CUDA_CHECK(cudaStreamBeginCapture(ws->ws_stream, cudaStreamCaptureModeRelaxed));
 
-            C10_CUDA_CHECK(cudaMemsetAsync(ws->refreshed_counts.data_ptr(), 0, static_cast<size_t>(B) * sizeof(int), ws->ws_stream));
-            C10_CUDA_CHECK(cudaMemsetAsync(ws->skipped_counts.data_ptr(), 0, static_cast<size_t>(B) * sizeof(int), ws->ws_stream));
             C10_CUDA_CHECK(cudaMemsetAsync(ws->fps_idx.data_ptr(), 0, static_cast<size_t>(B) * M * sizeof(int64_t), ws->ws_stream));
 
             fps_exact_bucketed_init_kernel<D, threads><<<bucket_blocks, threads, 0, ws->ws_stream>>>(
@@ -1844,7 +1521,7 @@ std::tuple<
                 ws->bucket_max_dist_sq.data_ptr<float>(),
                 ws->bucket_max_leaf.data_ptr<int>(),
                 ws->bucket_aabb.data_ptr<float>(),
-                ws->refreshed_counts.data_ptr<int>(),
+                nullptr,
                 B, N, M, leaf_level, bucket_level, bucket_count, 0
             );
 
@@ -1868,8 +1545,8 @@ std::tuple<
                     ws->bucket_max_dist_sq.data_ptr<float>(),
                     ws->bucket_max_leaf.data_ptr<int>(),
                     ws->bucket_aabb.data_ptr<float>(),
-                    ws->refreshed_counts.data_ptr<int>(),
-                    ws->skipped_counts.data_ptr<int>(),
+                    nullptr,
+                    nullptr,
                     B, N, M, bucket_count, round_idx, enable_pruning, 0
                 );
             }
@@ -1893,31 +1570,10 @@ std::tuple<
         C10_CUDA_CHECK(cudaStreamWaitEvent(main_stream, ws->ws_output_ready, 0));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        auto bucket_info = torch::empty({16}, i32_options);
-        auto bucket_info_cpu = torch::empty({16}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-        auto* info = bucket_info_cpu.data_ptr<int>();
-        info[0] = bucket_level;
-        info[1] = bucket_count;
-        info[2] = min_bucket_size;
-        info[3] = max_bucket_size;
-        info[4] = bucket_size;
-        info[5] = enable_pruning ? 1 : 0;
-        info[6] = 1;
-        info[7] = 1;
-        info[8] = M > 0 ? M - 1 : 0;
-        info[9] = 1;
-        for (int i = 10; i < 16; ++i) {
-            info[i] = 0;
-        }
-        bucket_info.copy_(bucket_info_cpu, false);
-
         return std::make_tuple(
             ws->fps_idx.clone(),
             ws->nearest_anchor.clone(),
-            ws->nearest_dist_sq.clone(),
-            ws->refreshed_counts.clone(),
-            ws->skipped_counts.clone(),
-            bucket_info
+            ws->nearest_dist_sq.clone()
         );
     }
 
@@ -1931,8 +1587,6 @@ std::tuple<
     auto bucket_max_dist_sq = torch::empty({B, bucket_count}, f_options);
     auto bucket_max_leaf = torch::empty({B, bucket_count}, i32_options);
     auto bucket_aabb = torch::empty({B, bucket_count, 2 * D}, f_options);
-    auto refreshed_counts = torch::zeros({B}, i32_options);
-    auto skipped_counts = torch::zeros({B}, i32_options);
 
     fps_exact_bucketed_init_kernel<D, threads><<<bucket_blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         points.data_ptr<float>(),
@@ -1946,7 +1600,7 @@ std::tuple<
         bucket_max_dist_sq.data_ptr<float>(),
         bucket_max_leaf.data_ptr<int>(),
         bucket_aabb.data_ptr<float>(),
-        refreshed_counts.data_ptr<int>(),
+        nullptr,
         B, N, M, leaf_level, bucket_level, bucket_count, 0
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1972,8 +1626,8 @@ std::tuple<
             bucket_max_dist_sq.data_ptr<float>(),
             bucket_max_leaf.data_ptr<int>(),
             bucket_aabb.data_ptr<float>(),
-            refreshed_counts.data_ptr<int>(),
-            skipped_counts.data_ptr<int>(),
+            nullptr,
+            nullptr,
             B, N, M, bucket_count, round_idx, enable_pruning, 0
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1990,58 +1644,16 @@ std::tuple<
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    auto bucket_info = torch::empty({16}, i32_options);
-    auto bucket_info_cpu = torch::empty({16}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-    auto* info = bucket_info_cpu.data_ptr<int>();
-    info[0] = bucket_level;
-    info[1] = bucket_count;
-    info[2] = min_bucket_size;
-    info[3] = max_bucket_size;
-    info[4] = bucket_size;
-    info[5] = enable_pruning ? 1 : 0;
-    info[6] = use_graph ? 1 : 0;
-    info[7] = 0; // graph capture is intentionally not used by this exact fallback path
-    info[8] = M > 0 ? M - 1 : 0;
-    info[9] = 1; // route id: exact bucketed
-    for (int i = 10; i < 16; ++i) {
-        info[i] = 0;
-    }
-    bucket_info.copy_(bucket_info_cpu, false);
-
-    return std::make_tuple(
-        fps_idx,
-        nearest_anchor,
-        nearest_dist_sq,
-        refreshed_counts,
-        skipped_counts,
-        bucket_info
-    );
+    return std::make_tuple(fps_idx, nearest_anchor, nearest_dist_sq);
 }
 
 
 
 
-std::tuple<
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor
-> fps_approx_bucketed_cuda(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_approx_bucketed_lean_cuda(
     torch::Tensor points,
     torch::Tensor seed_indices,
     torch::Tensor sorted_indices,
-    torch::Tensor left_child_mem,
-    torch::Tensor right_child_mem,
-    torch::Tensor mem_to_leaf,
-    torch::Tensor node_aabbs,
-    int num_real_nodes,
-    int leaf_level,
     int M,
     int bucket_size,
     int refresh_interval,
@@ -2050,184 +1662,90 @@ std::tuple<
     double alpha,
     bool use_graph
 ) {
-    TORCH_CHECK(points.is_cuda(), "fps_approx_bucketed: points must be a CUDA tensor");
-    TORCH_CHECK(seed_indices.is_cuda(), "fps_approx_bucketed: seed_indices must be a CUDA tensor");
-    TORCH_CHECK(sorted_indices.is_cuda(), "fps_approx_bucketed: sorted_indices must be a CUDA tensor");
-    TORCH_CHECK(left_child_mem.is_cuda(), "fps_approx_bucketed: left_child_mem must be a CUDA tensor");
-    TORCH_CHECK(right_child_mem.is_cuda(), "fps_approx_bucketed: right_child_mem must be a CUDA tensor");
-    TORCH_CHECK(mem_to_leaf.is_cuda(), "fps_approx_bucketed: mem_to_leaf must be a CUDA tensor");
-    TORCH_CHECK(node_aabbs.is_cuda(), "fps_approx_bucketed: node_aabbs must be a CUDA tensor");
-    TORCH_CHECK(points.is_contiguous(), "fps_approx_bucketed: points must be contiguous");
-    TORCH_CHECK(seed_indices.is_contiguous(), "fps_approx_bucketed: seed_indices must be contiguous");
-    TORCH_CHECK(sorted_indices.is_contiguous(), "fps_approx_bucketed: sorted_indices must be contiguous");
-    TORCH_CHECK(left_child_mem.is_contiguous(), "fps_approx_bucketed: left_child_mem must be contiguous");
-    TORCH_CHECK(right_child_mem.is_contiguous(), "fps_approx_bucketed: right_child_mem must be contiguous");
-    TORCH_CHECK(mem_to_leaf.is_contiguous(), "fps_approx_bucketed: mem_to_leaf must be contiguous");
-    TORCH_CHECK(node_aabbs.is_contiguous(), "fps_approx_bucketed: node_aabbs must be contiguous");
-    TORCH_CHECK(points.scalar_type() == torch::kFloat32, "fps_approx_bucketed: points must be float32");
-    TORCH_CHECK(seed_indices.scalar_type() == torch::kInt64, "fps_approx_bucketed: seed_indices must be int64");
-    TORCH_CHECK(sorted_indices.scalar_type() == torch::kInt64, "fps_approx_bucketed: sorted_indices must be int64");
-    TORCH_CHECK(left_child_mem.scalar_type() == torch::kInt32, "fps_approx_bucketed: left_child_mem must be int32");
-    TORCH_CHECK(right_child_mem.scalar_type() == torch::kInt32, "fps_approx_bucketed: right_child_mem must be int32");
-    TORCH_CHECK(mem_to_leaf.scalar_type() == torch::kInt32, "fps_approx_bucketed: mem_to_leaf must be int32");
-    TORCH_CHECK(node_aabbs.scalar_type() == torch::kFloat32, "fps_approx_bucketed: node_aabbs must be float32");
-    TORCH_CHECK(points.dim() == 3, "fps_approx_bucketed: points must have shape (B, N, D)");
-    TORCH_CHECK(seed_indices.dim() == 1, "fps_approx_bucketed: seed_indices must have shape (B,)");
-    TORCH_CHECK(sorted_indices.dim() == 2, "fps_approx_bucketed: sorted_indices must have shape (B, N)");
-    TORCH_CHECK(node_aabbs.dim() == 3, "fps_approx_bucketed: node_aabbs must have shape (B, num_real_nodes, 2 * D)");
-    TORCH_CHECK(left_child_mem.dim() == 1 && right_child_mem.dim() == 1 && mem_to_leaf.dim() == 1, "fps_approx_bucketed: child/leaf arrays must be 1D");
-    TORCH_CHECK(points.size(0) >= 1, "fps_approx_bucketed: batch size must be at least 1");
-    TORCH_CHECK(points.size(1) >= 1, "fps_approx_bucketed: points must contain at least one point per sample");
-    TORCH_CHECK(points.size(2) == 2 || points.size(2) == 3, "fps_approx_bucketed: D must be 2 or 3");
-
+    const char* op = "fps_approx_bucketed_lean";
+    TORCH_CHECK(points.is_cuda() && points.is_contiguous()
+                && points.scalar_type() == torch::kFloat32,
+                op, ": points must be contiguous CUDA float32");
+    TORCH_CHECK(seed_indices.is_cuda() && seed_indices.is_contiguous()
+                && seed_indices.scalar_type() == torch::kInt64,
+                op, ": seed_indices must be contiguous CUDA int64");
+    TORCH_CHECK(sorted_indices.is_cuda() && sorted_indices.is_contiguous()
+                && sorted_indices.scalar_type() == torch::kInt64,
+                op, ": sorted_indices must be contiguous CUDA int64");
+    TORCH_CHECK(points.dim() == 3 && (points.size(2) == 2 || points.size(2) == 3),
+                op, ": points must have shape (B, N, 2|3)");
     const int B = static_cast<int>(points.size(0));
     const int N = static_cast<int>(points.size(1));
-    const int D = static_cast<int>(points.size(2));
-    TORCH_CHECK(seed_indices.size(0) == B, "fps_approx_bucketed: seed_indices length must match batch size");
-    TORCH_CHECK(sorted_indices.size(0) == B && sorted_indices.size(1) == N, "fps_approx_bucketed: sorted_indices shape must match points");
-    TORCH_CHECK(node_aabbs.size(0) == B && node_aabbs.size(1) == num_real_nodes && node_aabbs.size(2) == 2 * D, "fps_approx_bucketed: node_aabbs shape mismatch");
-    TORCH_CHECK(left_child_mem.size(0) == num_real_nodes, "fps_approx_bucketed: left_child_mem length must match num_real_nodes");
-    TORCH_CHECK(right_child_mem.size(0) == num_real_nodes, "fps_approx_bucketed: right_child_mem length must match num_real_nodes");
-    TORCH_CHECK(mem_to_leaf.size(0) == num_real_nodes, "fps_approx_bucketed: mem_to_leaf length must match num_real_nodes");
-    TORCH_CHECK(leaf_level == implicit_bvh::tree::leaf_level(N), "fps_approx_bucketed: leaf_level must match N");
-    TORCH_CHECK(M >= 1 && M <= N, "fps_approx_bucketed: target token count must be in [1, N]");
-
+    TORCH_CHECK(B >= 1 && N >= 1, op, ": points must be nonempty");
+    TORCH_CHECK(seed_indices.dim() == 1 && seed_indices.size(0) == B,
+                op, ": seed_indices must have shape (B,)");
+    TORCH_CHECK(sorted_indices.dim() == 2
+                && sorted_indices.size(0) == B && sorted_indices.size(1) == N,
+                op, ": sorted_indices must have shape (B, N)");
+    TORCH_CHECK(M >= 1 && M <= N, op, ": M must be in [1, N]");
     c10::cuda::CUDAGuard device_guard(points.device());
-    TORCH_CHECK(seed_indices.device() == points.device(), "fps_approx_bucketed: seed_indices and points must be on the same device");
-    TORCH_CHECK(sorted_indices.device() == points.device(), "fps_approx_bucketed: sorted_indices and points must be on the same device");
-    TORCH_CHECK(left_child_mem.device() == points.device(), "fps_approx_bucketed: left_child_mem and points must be on the same device");
-    TORCH_CHECK(right_child_mem.device() == points.device(), "fps_approx_bucketed: right_child_mem and points must be on the same device");
-    TORCH_CHECK(mem_to_leaf.device() == points.device(), "fps_approx_bucketed: mem_to_leaf and points must be on the same device");
-    TORCH_CHECK(node_aabbs.device() == points.device(), "fps_approx_bucketed: node_aabbs and points must be on the same device");
+    TORCH_CHECK(seed_indices.device() == points.device()
+                && sorted_indices.device() == points.device(),
+                op, ": all inputs must share a device");
 
-    if (points.size(2) == 2) {
-        return fps_approx_bucketed_impl<2>(
-            points, seed_indices, sorted_indices, left_child_mem, right_child_mem,
-            mem_to_leaf, node_aabbs, num_real_nodes, leaf_level, M, bucket_size,
+    const int leaf_level = implicit_bvh::tree::leaf_level(N);
+    return points.size(2) == 2
+        ? fps_approx_bucketed_impl<2>(
+            points, seed_indices, sorted_indices, leaf_level, M, bucket_size,
             refresh_interval, candidates_per_round, anchors_per_round,
-            static_cast<float>(alpha), use_graph
-        );
-    }
-    return fps_approx_bucketed_impl<3>(
-        points, seed_indices, sorted_indices, left_child_mem, right_child_mem,
-        mem_to_leaf, node_aabbs, num_real_nodes, leaf_level, M, bucket_size,
-        refresh_interval, candidates_per_round, anchors_per_round,
-        static_cast<float>(alpha), use_graph
-    );
+            static_cast<float>(alpha), use_graph)
+        : fps_approx_bucketed_impl<3>(
+            points, seed_indices, sorted_indices, leaf_level, M, bucket_size,
+            refresh_interval, candidates_per_round, anchors_per_round,
+            static_cast<float>(alpha), use_graph);
 }
 
 // ---------------------------------------------------------------------------
 // C++/pybind entry points for maintained FPS routes
 // ---------------------------------------------------------------------------
 
-std::tuple<
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor,
-    torch::Tensor
-> fps_exact_bucketed_cuda(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_exact_bucketed_lean_cuda(
     torch::Tensor points,
     torch::Tensor seed_indices,
     torch::Tensor sorted_indices,
-    torch::Tensor left_child_mem,
-    torch::Tensor right_child_mem,
-    torch::Tensor mem_to_leaf,
-    torch::Tensor node_aabbs,
-    int num_real_nodes,
-    int leaf_level,
     int M,
     int bucket_size,
-    bool use_graph,
-    bool enable_pruning
+    bool enable_pruning,
+    bool use_graph
 ) {
-    TORCH_CHECK(points.is_cuda(), "fps_exact_bucketed: points must be a CUDA tensor");
-    TORCH_CHECK(seed_indices.is_cuda(), "fps_exact_bucketed: seed_indices must be a CUDA tensor");
-    TORCH_CHECK(sorted_indices.is_cuda(), "fps_exact_bucketed: sorted_indices must be a CUDA tensor");
-    TORCH_CHECK(left_child_mem.is_cuda(), "fps_exact_bucketed: left_child_mem must be a CUDA tensor");
-    TORCH_CHECK(right_child_mem.is_cuda(), "fps_exact_bucketed: right_child_mem must be a CUDA tensor");
-    TORCH_CHECK(mem_to_leaf.is_cuda(), "fps_exact_bucketed: mem_to_leaf must be a CUDA tensor");
-    TORCH_CHECK(node_aabbs.is_cuda(), "fps_exact_bucketed: node_aabbs must be a CUDA tensor");
-    TORCH_CHECK(points.is_contiguous(), "fps_exact_bucketed: points must be contiguous");
-    TORCH_CHECK(seed_indices.is_contiguous(), "fps_exact_bucketed: seed_indices must be contiguous");
-    TORCH_CHECK(sorted_indices.is_contiguous(), "fps_exact_bucketed: sorted_indices must be contiguous");
-    TORCH_CHECK(left_child_mem.is_contiguous(), "fps_exact_bucketed: left_child_mem must be contiguous");
-    TORCH_CHECK(right_child_mem.is_contiguous(), "fps_exact_bucketed: right_child_mem must be contiguous");
-    TORCH_CHECK(mem_to_leaf.is_contiguous(), "fps_exact_bucketed: mem_to_leaf must be contiguous");
-    TORCH_CHECK(node_aabbs.is_contiguous(), "fps_exact_bucketed: node_aabbs must be contiguous");
-    TORCH_CHECK(points.scalar_type() == torch::kFloat32, "fps_exact_bucketed: points must be float32");
-    TORCH_CHECK(seed_indices.scalar_type() == torch::kInt64, "fps_exact_bucketed: seed_indices must be int64");
-    TORCH_CHECK(sorted_indices.scalar_type() == torch::kInt64, "fps_exact_bucketed: sorted_indices must be int64");
-    TORCH_CHECK(left_child_mem.scalar_type() == torch::kInt32, "fps_exact_bucketed: left_child_mem must be int32");
-    TORCH_CHECK(right_child_mem.scalar_type() == torch::kInt32, "fps_exact_bucketed: right_child_mem must be int32");
-    TORCH_CHECK(mem_to_leaf.scalar_type() == torch::kInt32, "fps_exact_bucketed: mem_to_leaf must be int32");
-    TORCH_CHECK(node_aabbs.scalar_type() == torch::kFloat32, "fps_exact_bucketed: node_aabbs must be float32");
-    TORCH_CHECK(points.dim() == 3, "fps_exact_bucketed: points must have shape (B, N, D)");
-    TORCH_CHECK(seed_indices.dim() == 1, "fps_exact_bucketed: seed_indices must have shape (B,)");
-    TORCH_CHECK(sorted_indices.dim() == 2, "fps_exact_bucketed: sorted_indices must have shape (B, N)");
-    TORCH_CHECK(node_aabbs.dim() == 3, "fps_exact_bucketed: node_aabbs must have shape (B, num_real_nodes, 2 * D)");
-    TORCH_CHECK(left_child_mem.dim() == 1 && right_child_mem.dim() == 1 && mem_to_leaf.dim() == 1, "fps_exact_bucketed: child/leaf arrays must be 1D");
-    TORCH_CHECK(points.size(0) >= 1, "fps_exact_bucketed: batch size must be at least 1");
-    TORCH_CHECK(points.size(1) >= 1, "fps_exact_bucketed: points must contain at least one point per sample");
-    TORCH_CHECK(points.size(2) == 2 || points.size(2) == 3, "fps_exact_bucketed: D must be 2 or 3");
-
+    const char* op = "fps_exact_bucketed_lean";
+    TORCH_CHECK(points.is_cuda() && points.is_contiguous()
+                && points.scalar_type() == torch::kFloat32,
+                op, ": points must be contiguous CUDA float32");
+    TORCH_CHECK(seed_indices.is_cuda() && seed_indices.is_contiguous()
+                && seed_indices.scalar_type() == torch::kInt64,
+                op, ": seed_indices must be contiguous CUDA int64");
+    TORCH_CHECK(sorted_indices.is_cuda() && sorted_indices.is_contiguous()
+                && sorted_indices.scalar_type() == torch::kInt64,
+                op, ": sorted_indices must be contiguous CUDA int64");
+    TORCH_CHECK(points.dim() == 3 && (points.size(2) == 2 || points.size(2) == 3),
+                op, ": points must have shape (B, N, 2|3)");
     const int B = static_cast<int>(points.size(0));
     const int N = static_cast<int>(points.size(1));
-    const int D = static_cast<int>(points.size(2));
-    TORCH_CHECK(seed_indices.size(0) == B, "fps_exact_bucketed: seed_indices length must match batch size");
-    TORCH_CHECK(sorted_indices.size(0) == B && sorted_indices.size(1) == N, "fps_exact_bucketed: sorted_indices shape must match points");
-    TORCH_CHECK(node_aabbs.size(0) == B && node_aabbs.size(1) == num_real_nodes && node_aabbs.size(2) == 2 * D, "fps_exact_bucketed: node_aabbs shape mismatch");
-    TORCH_CHECK(left_child_mem.size(0) == num_real_nodes, "fps_exact_bucketed: left_child_mem length must match num_real_nodes");
-    TORCH_CHECK(right_child_mem.size(0) == num_real_nodes, "fps_exact_bucketed: right_child_mem length must match num_real_nodes");
-    TORCH_CHECK(mem_to_leaf.size(0) == num_real_nodes, "fps_exact_bucketed: mem_to_leaf length must match num_real_nodes");
-    TORCH_CHECK(leaf_level == implicit_bvh::tree::leaf_level(N), "fps_exact_bucketed: leaf_level must match N");
-    TORCH_CHECK(M >= 1 && M <= N, "fps_exact_bucketed: target token count must be in [1, N]");
-    TORCH_CHECK(bucket_size >= 1, "fps_exact_bucketed: bucket_size must be >= 1");
-
+    TORCH_CHECK(B >= 1 && N >= 1, op, ": points must be nonempty");
+    TORCH_CHECK(seed_indices.dim() == 1 && seed_indices.size(0) == B,
+                op, ": seed_indices must have shape (B,)");
+    TORCH_CHECK(sorted_indices.dim() == 2
+                && sorted_indices.size(0) == B && sorted_indices.size(1) == N,
+                op, ": sorted_indices must have shape (B, N)");
+    TORCH_CHECK(M >= 1 && M <= N, op, ": M must be in [1, N]");
+    TORCH_CHECK(bucket_size >= 1, op, ": bucket_size must be >= 1");
     c10::cuda::CUDAGuard device_guard(points.device());
-    TORCH_CHECK(seed_indices.device() == points.device(), "fps_exact_bucketed: seed_indices and points must be on the same device");
-    TORCH_CHECK(sorted_indices.device() == points.device(), "fps_exact_bucketed: sorted_indices and points must be on the same device");
-    TORCH_CHECK(left_child_mem.device() == points.device(), "fps_exact_bucketed: left_child_mem and points must be on the same device");
-    TORCH_CHECK(right_child_mem.device() == points.device(), "fps_exact_bucketed: right_child_mem and points must be on the same device");
-    TORCH_CHECK(mem_to_leaf.device() == points.device(), "fps_exact_bucketed: mem_to_leaf and points must be on the same device");
-    TORCH_CHECK(node_aabbs.device() == points.device(), "fps_exact_bucketed: node_aabbs and points must be on the same device");
+    TORCH_CHECK(seed_indices.device() == points.device()
+                && sorted_indices.device() == points.device(),
+                op, ": all inputs must share a device");
 
-    if (points.size(2) == 2) {
-        return fps_exact_bucketed_impl<2>(
-            points, seed_indices, sorted_indices, left_child_mem, right_child_mem,
-            mem_to_leaf, node_aabbs, num_real_nodes, leaf_level, M, bucket_size,
-            use_graph, enable_pruning
-        );
-    }
-    return fps_exact_bucketed_impl<3>(
-        points, seed_indices, sorted_indices, left_child_mem, right_child_mem,
-        mem_to_leaf, node_aabbs, num_real_nodes, leaf_level, M, bucket_size,
-        use_graph, enable_pruning
-    );
-}
-
-
-
-
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fps_exact_full_scan_cuda(
-    torch::Tensor points,
-    torch::Tensor seed_indices,
-    int M
-) {
-    TORCH_CHECK(points.is_cuda(), "fps_exact_full_scan: points must be CUDA");
-    TORCH_CHECK(seed_indices.is_cuda(), "fps_exact_full_scan: seed_indices must be CUDA");
-    TORCH_CHECK(points.is_contiguous() && seed_indices.is_contiguous(), "fps_exact_full_scan: tensors must be contiguous");
-    TORCH_CHECK(points.scalar_type() == torch::kFloat32, "fps_exact_full_scan: points must be float32");
-    TORCH_CHECK(seed_indices.scalar_type() == torch::kInt64, "fps_exact_full_scan: seed_indices must be int64");
-    TORCH_CHECK(points.dim() == 3 && seed_indices.dim() == 1, "fps_exact_full_scan: shape mismatch");
-    TORCH_CHECK(points.size(2) == 2 || points.size(2) == 3, "fps_exact_full_scan: D must be 2 or 3");
-    TORCH_CHECK(seed_indices.size(0) == points.size(0), "fps_exact_full_scan: seed_indices length mismatch");
-    TORCH_CHECK(M >= 1 && M <= points.size(1), "fps_exact_full_scan: M must be in [1, N]");
-    c10::cuda::CUDAGuard device_guard(points.device());
-    if (points.size(2) == 2) {
-        return fps_exact_full_scan_impl<2>(points, seed_indices, M);
-    }
-    return fps_exact_full_scan_impl<3>(points, seed_indices, M);
+    const int leaf_level = implicit_bvh::tree::leaf_level(N);
+    return points.size(2) == 2
+        ? fps_exact_bucketed_impl<2>(
+            points, seed_indices, sorted_indices, leaf_level, M, bucket_size,
+            use_graph, enable_pruning)
+        : fps_exact_bucketed_impl<3>(
+            points, seed_indices, sorted_indices, leaf_level, M, bucket_size,
+            use_graph, enable_pruning);
 }

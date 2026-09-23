@@ -4,7 +4,7 @@ import torch
 
 from ._constants import EXACT_DISTANCE_EPSILON, SUPPORTED_DIMS
 from ._handles import _temporary_bvh
-from ._query import build_bvh_batched, query_knn_batched
+from ._query import _build_bvh_batched, _query_knn_batched
 from ._validation import _as_contiguous, _as_contiguous_int64, _validate_cuda_float32
 
 __all__ = [
@@ -55,9 +55,9 @@ def query_displaced_knn(
     batch_size, n, heads, dim = q.shape
     flat_queries = q.reshape(batch_size, n * heads, dim).contiguous()
     source_pos = pos.detach().contiguous()
-    with _temporary_bvh(build_bvh_batched, source_pos) as batched_bvh:
+    with _temporary_bvh(_build_bvh_batched, source_pos) as batched_bvh:
         if return_positions:
-            indices, squared_distances, neighbor_positions = query_knn_batched(
+            indices, squared_distances, neighbor_positions = _query_knn_batched(
                 batched_bvh,
                 flat_queries,
                 k,
@@ -70,7 +70,7 @@ def query_displaced_knn(
                 neighbor_positions.reshape(batch_size, n, heads, k, dim).contiguous(),
             )
 
-        indices, squared_distances = query_knn_batched(
+        indices, squared_distances = _query_knn_batched(
             batched_bvh,
             flat_queries,
             k,

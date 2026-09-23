@@ -18,6 +18,7 @@ nav:
   - API Reference: api_reference.md
   - Lifecycle And Gradients: lifecycle_and_gradients.md
   - Performance: performance.md
+  - Testing: testing.md
   - Examples: examples.md
 
 markdown_extensions:

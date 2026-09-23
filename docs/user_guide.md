@@ -1,15 +1,10 @@
 # User Guide
 
-`torchbvh` expects CUDA float32 tensors, `D in {2, 3}`, and `k in {4, 8, 16}`.
-Callers provide finite inputs. Public APIs accept non-contiguous PyTorch views
-and may make layout-only contiguous copies internally for CUDA kernels.
-Gradients do not flow through BVH construction, FPS, or discrete neighbor
-selection.
+`torchbvh` expects CUDA float32 tensors, `D in {2, 3}`, and `k in {4, 8, 16}`. Callers provide finite inputs. Public APIs accept non-contiguous PyTorch views and may make layout-only contiguous copies internally for CUDA kernels. Gradients do not flow through BVH construction, FPS, or discrete neighbor selection.
 
 ## Single-Sample k-NN
 
-Use `BVH(points)` for one point cloud. Distances are squared Euclidean distances
-sorted ascending with their matching indices.
+Use `BVH(points)` for one point cloud. Distances are squared Euclidean distances sorted ascending with their matching indices.
 
 ```python
 import torch
@@ -22,8 +17,7 @@ bvh = tb.BVH(points)
 idx, dist_sq = bvh.knn(query_pts, k=8)                       # (N, 8) int64, (N, 8) float32
 ```
 
-The class owns the native handle. Use the context-manager form when lifetime
-should be scoped to a block.
+The class owns the native handle. Use the context-manager form when lifetime should be scoped to a block.
 
 ```python
 with tb.BVH(points) as bvh:                                  # points: (N, D)
@@ -32,8 +26,7 @@ with tb.BVH(points) as bvh:                                  # points: (N, D)
 
 ## Fixed-Size Batched k-NN
 
-For equal-size batches, pass `(B, N, D)` points. Query points use the same batch
-dimension and return local per-sample indices.
+For equal-size batches, pass `(B, N, D)` points. Query points use the same batch dimension and return local per-sample indices.
 
 ```python
 points = torch.randn(4, 4096, 3, device="cuda")              # (B, N, D) float32
@@ -45,8 +38,7 @@ idx, dist_sq = bvh.knn(query_pts, k=8)                       # (B, N, 8), (B, N,
 
 ## Ragged k-NN
 
-For variable-size samples, pack source points as `(total_N, D)` and provide
-1-D int64 start offsets. Ragged handles support k-NN only.
+For variable-size samples, pack source points as `(total_N, D)` and provide 1-D int64 start offsets. Ragged handles support k-NN only.
 
 ```python
 points = torch.randn(9000, 3, device="cuda")                 # (total_N, D) float32
@@ -60,13 +52,11 @@ bvh = tb.BVH(points, batch_offsets=batch_offsets)
 idx, dist_sq = bvh.knn(query_pts, k=8, query_offsets=query_offsets)  # (total_M, 8), (total_M, 8)
 ```
 
-`bvh.interpolate(...)` raises `TypeError` for ragged handles. Build a
-single-sample or fixed-size batched BVH for MLS interpolation.
+`bvh.interpolate(...)` raises `TypeError` for ragged handles. Build a single-sample or fixed-size batched BVH for MLS interpolation.
 
 ## MLS Interpolation
 
-Use MLS when features live on source points and query positions may be displaced.
-Gradients flow to `features` and live `displaced_pts`.
+Use MLS when features live on source points and query positions may be displaced. Gradients flow to `features` and live `displaced_pts`.
 
 ```python
 points = torch.randn(4096, 3, device="cuda")                         # (N, D) float32
@@ -84,8 +74,7 @@ The procedural alias is useful in low-level pipelines.
 interpolated = tb.mls_interpolate(points, displaced_pts, features, k=8) # (N, Ch) float32
 ```
 
-`return_grad=True` returns the spatial MLS field gradient. It is data returned by
-the operator, not PyTorch autograd metadata.
+`return_grad=True` returns the spatial MLS field gradient. It is data returned by the operator, not PyTorch autograd metadata.
 
 ```python
 interpolated, field_gradient = bvh.interpolate(
@@ -93,13 +82,56 @@ interpolated, field_gradient = bvh.interpolate(
 )                                                                    # (N, Ch), (N, D, Ch)
 ```
 
-The same calls support fixed-size batches with `(B, N, D)` geometry and
-`(B, N, Ch)` features.
+The same calls support fixed-size batches with `(B, N, D)` geometry and `(B, N, Ch)` features.
+
+## Ray Tracing
+
+Use `raytrace` for a one-off closest-hit query, or `RayBVH` when tracing many ray sets against the same geometry. A 2-D primitive is a line segment; a 3-D primitive is a triangle. Ray directions need not be normalized, so `t` is the parameter in `origin + t * direction`.
+
+```python
+segments = torch.tensor([[[0.0, 0.0], [1.0, 0.0]]], device="cuda")
+origins = torch.tensor([[0.5, 1.0]], device="cuda")
+directions = torch.tensor([[0.0, -1.0]], device="cuda")
+hits = tb.raytrace(segments, origins, directions, primitive_type="segment")
+
+hits.mask                 # (1,) bool; True for this ray
+hits.primitive_indices    # (1,) int64; 0 for this ray, -1 on a miss
+hits.t                    # (1,) float32; 1.0 for this ray, inf on a miss
+hits.points               # (1, 2) float32; NaN rows on a miss
+```
+
+For triangles, use `(F, 3, 3)` primitives and 3-D origins and directions. Batch dimensions and matching-head ray dimensions are also supported; see [RayBVH and raytrace](api_reference.md#raybvh-and-raytrace) for shapes and limits. The winning primitive is a discrete choice. First-order gradients for hit distance and position flow only through the selected live intersection; miss outputs have zero gradients.
+
+## Conditional MLS Routing
+
+When each query should sample either one source field or another, use `conditional_mls_interpolate`. A Boolean `(B, M, H)` mask selects the true branch. Only the selected query and feature branch participates in the MLS solve, so an inactive query branch may contain NaNs.
+
+```python
+mask = torch.rand(2, 8, 2, device="cuda") > 0.5
+true_points = torch.rand(2, 32, 2, device="cuda")
+false_points = torch.rand(2, 32, 2, device="cuda")
+true_queries = torch.rand(2, 8, 2, 2, device="cuda")
+false_queries = torch.rand(2, 8, 2, 2, device="cuda")
+true_features = torch.rand(2, 32, 2, 4, device="cuda")
+false_features = torch.rand(2, 32, 2, 4, device="cuda")
+
+values = tb.conditional_mls_interpolate(
+    mask,
+    true_points=true_points,
+    true_queries=true_queries,
+    true_features=true_features,
+    false_points=false_points,
+    false_queries=false_queries,
+    false_features=false_features,
+    k=4,
+)  # (2, 8, 2, 4)
+```
+
+One common mask is the `RayHitResult.mask` from segment or triangle tracing: hits sample a boundary field at `hits.points`, while misses sample a bulk field at the ray endpoint. The complete runnable setup is in the README quickstart.
 
 ## Displaced-Query Workflow
 
-For multihead displaced queries, build one BVH per sample over `pos` and reuse it
-across all `H` heads. The helper owns that shape choreography.
+For multihead displaced queries, build one BVH per sample over `pos` and reuse it across all `H` heads. The helper owns that shape choreography.
 
 ```python
 pos = torch.randn(2, 4096, 3, device="cuda")                    # (B, N, D) float32
@@ -114,14 +146,12 @@ gathered = tb.gather_neighbor_values(values, idx)               # (B, N, H, 8, C
 out = tb.interpolate_displaced(pos, displaced_queries, values, k=8) # (B, N, H, Ch)
 ```
 
-Gradients flow to `values` only through `gather_neighbor_values(...)` and
-`interpolate_displaced(...)`. Indices, distances, source positions, and displaced
-query geometry are discrete query inputs for these helpers.
+Gradients flow to `values` only through `gather_neighbor_values(...)` and `interpolate_displaced(...)`.
+Indices, distances, source positions, and displaced query geometry are discrete query inputs for these helpers.
 
 ## FPS Downsampling Geometry
 
-`fps(points, target_tokens)` selects farthest-point anchors for `(N, D)` or
-`(B, N, D)` inputs and returns geometry plus assignment metadata.
+`fps(points, target_tokens)` selects farthest-point anchors for `(N, D)` or `(B, N, D)` inputs and returns geometry plus assignment metadata.
 
 ```python
 points = torch.randn(4, 4096, 3, device="cuda")                 # (B, N, D) float32
@@ -133,23 +163,21 @@ result.nearest_anchor              # (B, N) int32, assignment to selection-order
 result.nearest_anchor_dist_sq      # (B, N) float32, squared distance to assigned anchor
 result.anchor_radius               # (B, M) float32, max assigned squared distance
 result.anchor_counts               # (B, M) int32, number of points assigned per anchor
-result.coarse_order                # (B, M) int64, anchors ordered by BVH leaf position
+result.coarse_order                # (B, M) int64, anchors ordered by Morton position
 ```
 
-For a single sample, remove the leading `B` dimension: `indices` is `(M,)`,
-`points` is `(M, D)`, and assignment metadata is `(N,)` or `(M,)`.
+For a single sample, remove the leading `B` dimension: `indices` is `(M,)`, `points` is `(M, D)`, and assignment metadata is `(N,)` or `(M,)`.
 
-FPS is non-differentiable. Pass the assignment metadata to your own PyTorch
-pooling or unpooling logic.
+FPS is non-differentiable. Pass the assignment metadata to your own PyTorch pooling or unpooling logic.
+
+The default `mode="exact_bucketed"` selects the exact farthest point each round. `mode="approx_bucketed"` trades exact anchor selection for speed while returning the same result fields. Use `r`, `c`, and `alpha` to tune that route; compare assignment quality against your workload's tolerance.
 
 ## API Choice
 
-Prefer `BVH` for new code. It owns handle lifetime and dispatches across
-single-sample, fixed-size batched, and ragged k-NN workflows.
+Prefer `BVH` for new code. It owns handle lifetime and dispatches across single-sample, fixed-size batched, and ragged k-NN workflows.
 
-Use unified procedural functions such as `build_bvh`, `query_knn`, and
-`mls_interpolate` when a low-level pipeline needs explicit handle control.
+Use unified procedural functions such as `build_bvh`, `query_knn`, and `mls_interpolate` when a low-level pipeline needs explicit handle control.
 
-Per-variant aliases such as `build_bvh_batched` and `query_knn_batched` remain
-stable for compatibility and shape-specific integrations, but they are not the
-recommended starting point.
+Version 0.3.0 removes the old per-variant aliases. For ragged data, call 
+`build_bvh(points, batch_offsets=...)` and
+`query_knn(handle, queries, k, query_offsets=...)`.

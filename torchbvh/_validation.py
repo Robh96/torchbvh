@@ -73,24 +73,3 @@ def _validate_ragged_points(
     _validate_cuda_float32_contiguous(prefix, points, "points")
     return _validate_offsets(prefix, offsets, total_rows=int(points.size(0)), device=points.device)
 
-
-def _real_nodes_at_level(num_leaves: int, level: int) -> int:
-    leaf_level = (num_leaves - 1).bit_length()
-    virtual_leaves = (1 << leaf_level) - num_leaves
-    return (1 << level) - (virtual_leaves >> (leaf_level - level))
-
-
-def _choose_level_for_target_tokens(num_leaves: int, requested_tokens: int) -> int:
-    leaf_level = (num_leaves - 1).bit_length()
-    best_level = 0
-    best_count = _real_nodes_at_level(num_leaves, 0)
-    best_distance = abs(best_count - requested_tokens)
-    for level in range(1, leaf_level + 1):
-        count = _real_nodes_at_level(num_leaves, level)
-        distance = abs(count - requested_tokens)
-        if distance < best_distance or (distance == best_distance and count > best_count):
-            best_level = level
-            best_count = count
-            best_distance = distance
-    return best_level
-
