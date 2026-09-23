@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
@@ -16,8 +16,8 @@ def _assert_batched_knn_matches(
     *,
     check_loop_indices: bool = True,
 ):
-    bvh = torchbvh.build_bvh_batched(points.contiguous())
-    indices, distances, neighbor_positions = torchbvh.query_knn_batched(
+    bvh = torchbvh.build_bvh(points.contiguous())
+    indices, distances, neighbor_positions = torchbvh.query_knn(
         bvh,
         query_points.contiguous(),
         k,
@@ -79,8 +79,8 @@ def _assert_batched_true_tie_neighbors_are_valid(
     *,
     expected_distance_sq: float,
 ):
-    bvh = torchbvh.build_bvh_batched(points.contiguous())
-    indices, distances, neighbor_positions = torchbvh.query_knn_batched(
+    bvh = torchbvh.build_bvh(points.contiguous())
+    indices, distances, neighbor_positions = torchbvh.query_knn(
         bvh,
         query_points.contiguous(),
         k,
@@ -249,8 +249,8 @@ def test_batched_knn_indices_are_local_not_flattened():
     torch.manual_seed(13200)
     points = torch.rand((4, 20, 2), device="cuda", dtype=torch.float32)
     points[1:] += torch.tensor([10.0, -7.0], device="cuda")
-    bvh = torchbvh.build_bvh_batched(points.contiguous())
-    indices, distances = torchbvh.query_knn_batched(bvh, points[:, :5, :].contiguous(), 4)
+    bvh = torchbvh.build_bvh(points.contiguous())
+    indices, distances = torchbvh.query_knn(bvh, points[:, :5, :].contiguous(), 4)
 
     assert int(indices.max()) < points.size(1)
     assert int(indices.min()) >= 0
@@ -269,8 +269,8 @@ def test_batched_knn_point_warp_multihead_smoke_reuses_bvh_and_gathers_values():
     values = torch.randn((batch_size, n, heads, channels), device="cuda", dtype=torch.float32)
     values[1] += 100.0
 
-    bvh = torchbvh.build_bvh_batched(points.contiguous())
-    indices, distances, neighbor_positions = torchbvh.query_knn_batched(
+    bvh = torchbvh.build_bvh(points.contiguous())
+    indices, distances, neighbor_positions = torchbvh.query_knn(
         bvh,
         flat_queries,
         k,
@@ -310,10 +310,10 @@ def test_batched_knn_point_warp_multihead_smoke_reuses_bvh_and_gathers_values():
 def test_batched_knn_rejects_unsupported_k():
     assert torch.cuda.is_available()
     points = torch.rand((2, 8, 2), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
 
     with pytest.raises(ValueError, match="k must be 4, 8, or 16"):
-        torchbvh.query_knn_batched(bvh, points, 5)
+        torchbvh.query_knn(bvh, points, 5)
 
 
 def test_batched_knn_rejects_invalid_handle_type():
@@ -321,5 +321,5 @@ def test_batched_knn_rejects_invalid_handle_type():
     points = torch.rand((2, 8, 2), device="cuda", dtype=torch.float32).contiguous()
     single_bvh = torchbvh.build_bvh(points[0].contiguous())
 
-    with pytest.raises(TypeError, match="BatchedBVHHandle"):
-        torchbvh.query_knn_batched(single_bvh, points, 4)
+    with pytest.raises(ValueError, match="shape"):
+        torchbvh.query_knn(single_bvh, points, 4)

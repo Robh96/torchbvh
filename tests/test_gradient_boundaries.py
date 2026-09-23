@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
@@ -6,7 +6,7 @@ import torchbvh
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="Stage 7 gradient-boundary validation requires CUDA",
+    reason="gradient-boundary validation requires CUDA",
 )
 
 
@@ -65,7 +65,7 @@ def _feature_tensor(points, channels):
         ("degenerate_underdetermined", 3, 4, False, True),
     ],
 )
-def test_stage7_batched_mls_training_composition_gradient_boundaries(
+def test_batched_mls_training_composition_gradient_boundaries(
     name,
     dim,
     k,
@@ -82,7 +82,7 @@ def test_stage7_batched_mls_training_composition_gradient_boundaries(
         offsets[:, 0] = 0.0
     displaced_points = (points.detach()[:, :6, :] + offsets).contiguous().requires_grad_(True)
 
-    interpolated, field_gradient = torchbvh.bvh_mls_interpolate_batched(
+    interpolated, field_gradient = torchbvh.mls_interpolate(
         points,
         displaced_points,
         features,
@@ -108,7 +108,7 @@ def test_stage7_batched_mls_training_composition_gradient_boundaries(
         (3, 8, True),
     ],
 )
-def test_stage7_displaced_query_interpolation_values_only_gradient_boundary(dim, k, duplicate_heavy):
+def test_displaced_query_interpolation_values_only_gradient_boundary(dim, k, duplicate_heavy):
     pos = _base_points(dim, duplicate_heavy=duplicate_heavy, degenerate=False).requires_grad_(True)
     rho_data = torch.zeros((2, pos.size(1), 3, dim), device="cuda", dtype=torch.float32)
     rho_data[:, :, 1, 0] = 0.02
@@ -136,4 +136,5 @@ def test_stage7_displaced_query_interpolation_values_only_gradient_boundary(dim,
     _assert_no_grad(pos)
     _assert_no_grad(rho)
     _assert_no_grad(q)
+
 

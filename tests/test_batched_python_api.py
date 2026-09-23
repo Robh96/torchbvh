@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
@@ -10,7 +10,7 @@ def test_batched_build_query_destroy_lifecycle_and_shapes():
     points = torch.rand((3, 17, 3), device="cuda", dtype=torch.float32).contiguous()
     query_points = torch.rand((3, 5, 3), device="cuda", dtype=torch.float32).contiguous()
 
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
 
     assert isinstance(bvh, torchbvh.BatchedBVHHandle)
     assert not bvh.destroyed
@@ -26,7 +26,7 @@ def test_batched_build_query_destroy_lifecycle_and_shapes():
     for batch in range(3):
         torch.testing.assert_close(bvh["sorted_indices"][batch].sort().values, expected)
 
-    indices, distances, neighbor_positions = torchbvh.query_knn_batched(
+    indices, distances, neighbor_positions = torchbvh.query_knn(
         bvh,
         query_points,
         4,
@@ -50,25 +50,24 @@ def test_batched_build_query_destroy_lifecycle_and_shapes():
     torchbvh.destroy_bvh(bvh)
     assert bvh.destroyed
     with pytest.raises(RuntimeError, match="destroyed"):
-        torchbvh.query_knn_batched(bvh, query_points, 4)
+        torchbvh.query_knn(bvh, query_points, 4)
     with pytest.raises(RuntimeError, match="destroyed"):
         _ = bvh["dim"]
 
 
-def test_batched_api_accepts_legacy_mapping_and_rejects_single_sample_handle():
+def test_batched_api_rejects_plain_mapping_and_wrong_query_shape():
     assert torch.cuda.is_available()
     points = torch.rand((2, 16, 2), device="cuda", dtype=torch.float32).contiguous()
     query_points = points[:, :3, :].contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
     legacy_bvh = dict(bvh)
 
-    indices, distances = torchbvh.query_knn_batched(legacy_bvh, query_points, 4)
-    assert indices.shape == (2, 3, 4)
-    assert distances.shape == (2, 3, 4)
+    with pytest.raises(TypeError, match="BVHHandle"):
+        torchbvh.query_knn(legacy_bvh, query_points, 4)
 
     single = torchbvh.build_bvh(points[0].contiguous())
-    with pytest.raises(TypeError, match="BatchedBVHHandle"):
-        torchbvh.query_knn_batched(single, query_points, 4)
+    with pytest.raises(ValueError, match="shape"):
+        torchbvh.query_knn(single, query_points, 4)
     # Unified query_knn routes to the batched path; wrong-rank query raises ValueError.
     with pytest.raises(ValueError, match="shape"):
         torchbvh.query_knn(bvh, query_points[0].contiguous(), 4)
@@ -87,25 +86,25 @@ def test_batched_query_validation_errors(bad_query, match):
     assert torch.cuda.is_available()
     points = torch.rand((2, 16, 2), device="cuda", dtype=torch.float32).contiguous()
     query_points = torch.rand((2, 4, 2), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
 
     with pytest.raises((ValueError, RuntimeError), match=match):
-        torchbvh.query_knn_batched(bvh, bad_query(query_points), 4)
+        torchbvh.query_knn(bvh, bad_query(query_points), 4)
 
 
 def test_batched_query_rejects_unsupported_k_with_public_message():
     assert torch.cuda.is_available()
     points = torch.rand((2, 16, 2), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
 
     with pytest.raises(ValueError, match="k must be 4, 8, or 16"):
-        torchbvh.query_knn_batched(bvh, points, 5)
+        torchbvh.query_knn(bvh, points, 5)
 
 
 def test_batched_handle_idempotent_double_destroy():
     assert torch.cuda.is_available()
     points = torch.rand((2, 12, 3), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
     torchbvh.destroy_bvh(bvh)
     assert bvh.destroyed
     torchbvh.destroy_bvh(bvh)
@@ -117,8 +116,8 @@ def test_batched_build_rejects_wrong_rank_dtype_and_device():
     points = torch.rand((2, 16, 2), device="cuda", dtype=torch.float32).contiguous()
 
     with pytest.raises(ValueError, match="shape"):
-        torchbvh.build_bvh_batched(points[0])
+        torchbvh.build_bvh(points.unsqueeze(0))
     with pytest.raises(ValueError, match="float32"):
-        torchbvh.build_bvh_batched(points.double())
+        torchbvh.build_bvh(points.double())
     with pytest.raises(ValueError, match="CUDA"):
-        torchbvh.build_bvh_batched(points.cpu())
+        torchbvh.build_bvh(points.cpu())

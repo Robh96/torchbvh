@@ -1,8 +1,8 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
-from torchbvh import BVH, BatchedBVH, RaggedBVH
+from torchbvh import BVH
 
 
 def _make_points(n=20, dim=3):
@@ -23,18 +23,18 @@ def _make_features(n=20, f=4):
 
 def test_bvh_classes_exported_from_package():
     assert hasattr(torchbvh, "BVH")
-    assert hasattr(torchbvh, "BatchedBVH")
-    assert hasattr(torchbvh, "RaggedBVH")
+    assert not hasattr(torchbvh, "BatchedBVH")
+    assert not hasattr(torchbvh, "RaggedBVH")
 
 
 def test_bvh_classes_in_all():
     assert "BVH" in torchbvh.__all__
-    assert "BatchedBVH" in torchbvh.__all__
-    assert "RaggedBVH" in torchbvh.__all__
+    assert "BatchedBVH" not in torchbvh.__all__
+    assert "RaggedBVH" not in torchbvh.__all__
 
 
 # ---------------------------------------------------------------------------
-# BVH â€” no Mapping / __getitem__
+# BVH Ã¢â‚¬â€ no Mapping / __getitem__
 # ---------------------------------------------------------------------------
 
 
@@ -48,7 +48,7 @@ def test_bvh_does_not_expose_getitem():
 def test_batched_bvh_does_not_expose_getitem():
     assert torch.cuda.is_available()
     points = _make_points().unsqueeze(0).expand(2, -1, -1).contiguous()
-    bvh = BatchedBVH(points)
+    bvh = BVH(points)
     assert not hasattr(bvh, "__getitem__")
     bvh.destroy()
 
@@ -57,13 +57,13 @@ def test_ragged_bvh_does_not_expose_getitem():
     assert torch.cuda.is_available()
     points = _make_points()
     offsets = torch.tensor([0, 10, 20], device="cuda", dtype=torch.int64)
-    bvh = RaggedBVH(points, offsets)
+    bvh = BVH(points, batch_offsets=offsets)
     assert not hasattr(bvh, "__getitem__")
     bvh.destroy()
 
 
 # ---------------------------------------------------------------------------
-# BVH â€” lifecycle
+# BVH Ã¢â‚¬â€ lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +105,7 @@ def test_bvh_knn_after_destroy_raises():
 
 
 # ---------------------------------------------------------------------------
-# BVH â€” knn delegation
+# BVH Ã¢â‚¬â€ knn delegation
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +145,7 @@ def test_bvh_knn_with_source_points_matches_query_knn():
 
 
 # ---------------------------------------------------------------------------
-# BVH â€” interpolate delegation
+# BVH Ã¢â‚¬â€ interpolate delegation
 # ---------------------------------------------------------------------------
 
 
@@ -159,7 +159,7 @@ def test_bvh_interpolate_matches_bvh_mls_interpolate():
     with BVH(points) as bvh:
         result_cls = bvh.interpolate(displaced, features, k)
 
-    result_fn = torchbvh.bvh_mls_interpolate(points, displaced, features, k)
+    result_fn = torchbvh.mls_interpolate(points, displaced, features, k)
 
     assert isinstance(result_cls, torch.Tensor)
     torch.testing.assert_close(result_cls, result_fn, rtol=1e-5, atol=1e-5)
@@ -186,14 +186,14 @@ def test_bvh_interpolate_return_grad_true_returns_two_tuple():
 
 
 # ---------------------------------------------------------------------------
-# BatchedBVH â€” lifecycle
+# BatchedBVH Ã¢â‚¬â€ lifecycle
 # ---------------------------------------------------------------------------
 
 
 def test_batched_bvh_destroyed_is_false_before_destroy():
     assert torch.cuda.is_available()
     points = _make_points().unsqueeze(0).expand(2, -1, -1).contiguous()
-    bvh = BatchedBVH(points)
+    bvh = BVH(points)
     assert not bvh.destroyed
     bvh.destroy()
 
@@ -201,7 +201,7 @@ def test_batched_bvh_destroyed_is_false_before_destroy():
 def test_batched_bvh_context_manager_destroys_on_exit():
     assert torch.cuda.is_available()
     points = _make_points().unsqueeze(0).expand(2, -1, -1).contiguous()
-    with BatchedBVH(points) as bvh:
+    with BVH(points) as bvh:
         assert not bvh.destroyed
     assert bvh.destroyed
 
@@ -209,13 +209,13 @@ def test_batched_bvh_context_manager_destroys_on_exit():
 def test_batched_bvh_destroy_is_idempotent():
     assert torch.cuda.is_available()
     points = _make_points().unsqueeze(0).expand(2, -1, -1).contiguous()
-    bvh = BatchedBVH(points)
+    bvh = BVH(points)
     bvh.destroy()
     bvh.destroy()
 
 
 # ---------------------------------------------------------------------------
-# BatchedBVH â€” knn delegation
+# BatchedBVH Ã¢â‚¬â€ knn delegation
 # ---------------------------------------------------------------------------
 
 
@@ -226,11 +226,11 @@ def test_batched_bvh_knn_matches_query_knn_batched():
     queries = (points[:, 3:8, :] + 0.02).contiguous()
     k = 4
 
-    with BatchedBVH(points) as bvh:
+    with BVH(points) as bvh:
         idx_cls, dist_cls = bvh.knn(queries, k)
 
-    bvh_handle = torchbvh.build_bvh_batched(points)
-    idx_fn, dist_fn = torchbvh.query_knn_batched(bvh_handle, queries, k)
+    bvh_handle = torchbvh.build_bvh(points)
+    idx_fn, dist_fn = torchbvh.query_knn(bvh_handle, queries, k)
     torchbvh.destroy_bvh(bvh_handle)
 
     torch.testing.assert_close(idx_cls, idx_fn)
@@ -238,7 +238,7 @@ def test_batched_bvh_knn_matches_query_knn_batched():
 
 
 # ---------------------------------------------------------------------------
-# RaggedBVH â€” lifecycle
+# RaggedBVH Ã¢â‚¬â€ lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -246,7 +246,7 @@ def test_ragged_bvh_destroyed_is_false_before_destroy():
     assert torch.cuda.is_available()
     points = _make_points(20)
     offsets = torch.tensor([0, 10, 20], device="cuda", dtype=torch.int64)
-    bvh = RaggedBVH(points, offsets)
+    bvh = BVH(points, batch_offsets=offsets)
     assert not bvh.destroyed
     bvh.destroy()
 
@@ -255,13 +255,13 @@ def test_ragged_bvh_context_manager_destroys_on_exit():
     assert torch.cuda.is_available()
     points = _make_points(20)
     offsets = torch.tensor([0, 10, 20], device="cuda", dtype=torch.int64)
-    with RaggedBVH(points, offsets) as bvh:
+    with BVH(points, batch_offsets=offsets) as bvh:
         assert not bvh.destroyed
     assert bvh.destroyed
 
 
 # ---------------------------------------------------------------------------
-# RaggedBVH â€” knn delegation
+# RaggedBVH Ã¢â‚¬â€ knn delegation
 # ---------------------------------------------------------------------------
 
 
@@ -273,11 +273,11 @@ def test_ragged_bvh_knn_matches_query_knn_ragged():
     q_offsets = torch.tensor([0, 4, 8], device="cuda", dtype=torch.int64)
     k = 4
 
-    with RaggedBVH(points, src_offsets) as bvh:
+    with BVH(points, batch_offsets=src_offsets) as bvh:
         idx_cls, dist_cls = bvh.knn(queries, k, query_offsets=q_offsets)
 
-    bvh_handle = torchbvh.build_bvh_ragged(points, src_offsets)
-    idx_fn, dist_fn = torchbvh.query_knn_ragged(bvh_handle, queries, q_offsets, k)
+    bvh_handle = torchbvh.build_bvh(points, batch_offsets=src_offsets)
+    idx_fn, dist_fn = torchbvh.query_knn(bvh_handle, queries, k, query_offsets=q_offsets)
     torchbvh.destroy_bvh(bvh_handle)
 
     torch.testing.assert_close(idx_cls, idx_fn)
@@ -285,7 +285,7 @@ def test_ragged_bvh_knn_matches_query_knn_ragged():
 
 
 # ---------------------------------------------------------------------------
-# RaggedBVH â€” unsupported methods raise TypeError
+# RaggedBVH Ã¢â‚¬â€ unsupported methods raise TypeError
 # ---------------------------------------------------------------------------
 
 
@@ -293,6 +293,6 @@ def test_ragged_bvh_interpolate_raises_type_error():
     assert torch.cuda.is_available()
     points = _make_points(20)
     offsets = torch.tensor([0, 10, 20], device="cuda", dtype=torch.int64)
-    with RaggedBVH(points, offsets) as bvh:
+    with BVH(points, batch_offsets=offsets) as bvh:
         with pytest.raises(TypeError, match="interpolate"):
             bvh.interpolate(points[:5], _make_features(20))

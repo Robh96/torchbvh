@@ -3,6 +3,36 @@ import torch
 
 import torchbvh
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is required for BVH build tests", allow_module_level=True)
+
+
+def _tree_summary(num_leaves: int) -> dict:
+    """Independent Python oracle for the implicit-tree index layout."""
+    leaf_level = (num_leaves - 1).bit_length()
+    virtual_leaves = (1 << leaf_level) - num_leaves
+    nodes = []
+    for implicit_idx in range((1 << (leaf_level + 1)) - 1):
+        level = (implicit_idx + 1).bit_length() - 1
+        first_at_level = (1 << level) - 1
+        real_at_level = (1 << level) - (virtual_leaves >> (leaf_level - level))
+        is_virtual = implicit_idx - first_at_level >= real_at_level
+        virtual_prefix = virtual_leaves >> (leaf_level - level + 1)
+        virtual_before = 2 * virtual_prefix - virtual_prefix.bit_count()
+        nodes.append(
+            {
+                "implicit_idx": implicit_idx,
+                "level": level,
+                "is_virtual": is_virtual,
+                "memory_index": None if is_virtual else implicit_idx - virtual_before,
+            }
+        )
+    return {
+        "real_node_count": 2 * num_leaves - 1 + virtual_leaves.bit_count(),
+        "virtual_leaves": virtual_leaves,
+        "nodes": nodes,
+    }
+
 
 def _real_nodes(summary: dict) -> list[dict]:
     return [node for node in summary["nodes"] if not node["is_virtual"]]
@@ -36,7 +66,7 @@ def _assert_bvh_invariants(points: torch.Tensor):
     bvh = torchbvh.build_bvh(points.contiguous())
     node_aabbs = bvh["node_aabbs"]
     sorted_indices = bvh["sorted_indices"]
-    summary = torchbvh.implicit_tree_summary(points.shape[0])
+    summary = _tree_summary(points.shape[0])
     by_implicit = _node_by_implicit(summary)
     leaf_level = bvh["leaf_level"]
     first_leaf = (1 << leaf_level) - 1
@@ -285,7 +315,7 @@ def test_bvh_build_validates_single_child_internal_nodes_for_non_power_of_two_si
         ),
         dim=1,
     )
-    summary = torchbvh.implicit_tree_summary(n)
+    summary = _tree_summary(n)
 
     assert _single_child_internal_count(summary) > 0
     _assert_bvh_invariants(points)
@@ -313,8 +343,8 @@ def test_bvh_build_handles_fully_degenerate_2d_extent():
 def test_bvh_build_rejects_unsupported_inputs():
     assert torch.cuda.is_available()
 
-    with pytest.raises(RuntimeError, match="D must be 2 or 3"):
+    with pytest.raises(ValueError, match="D must be 2 or 3"):
         torchbvh.build_bvh(torch.zeros((4, 4), device="cuda", dtype=torch.float32))
 
-    with pytest.raises(RuntimeError, match="float32"):
+    with pytest.raises(ValueError, match="float32"):
         torchbvh.build_bvh(torch.zeros((4, 2), device="cuda", dtype=torch.float64))

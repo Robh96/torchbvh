@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import torchbvh
-from torchbvh import BVH, BatchedBVH, RaggedBVH
+from torchbvh import BVH
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -54,11 +54,11 @@ def test_batched_bvh_query_accepts_noncontiguous_points_queries_and_source_point
     points = _noncontiguous_float((2, 32, 3))
     queries = _noncontiguous_float((2, 7, 3), fill=points[:, :7, :] + 0.01)
 
-    bvh = torchbvh.build_bvh_batched(points)
-    actual = torchbvh.query_knn_batched(bvh, queries, 4, source_points=points)
+    bvh = torchbvh.build_bvh(points)
+    actual = torchbvh.query_knn(bvh, queries, 4, source_points=points)
 
-    expected_bvh = torchbvh.build_bvh_batched(points.contiguous())
-    expected = torchbvh.query_knn_batched(
+    expected_bvh = torchbvh.build_bvh(points.contiguous())
+    expected = torchbvh.query_knn(
         expected_bvh,
         queries.contiguous(),
         4,
@@ -77,21 +77,21 @@ def test_ragged_bvh_query_accepts_noncontiguous_points_queries_offsets_and_sourc
     point_offsets = _noncontiguous_int64([0, 9, 24])
     query_offsets = _noncontiguous_int64([0, 4, 10])
 
-    bvh = torchbvh.build_bvh_ragged(points, point_offsets)
-    actual = torchbvh.query_knn_ragged(
+    bvh = torchbvh.build_bvh(points, batch_offsets=point_offsets)
+    actual = torchbvh.query_knn(
         bvh,
         queries,
-        query_offsets,
         4,
+        query_offsets=query_offsets,
         source_points=points,
     )
 
-    expected_bvh = torchbvh.build_bvh_ragged(points.contiguous(), point_offsets.contiguous())
-    expected = torchbvh.query_knn_ragged(
+    expected_bvh = torchbvh.build_bvh(points.contiguous(), batch_offsets=point_offsets.contiguous())
+    expected = torchbvh.query_knn(
         expected_bvh,
         queries.contiguous(),
-        query_offsets.contiguous(),
         4,
+        query_offsets=query_offsets.contiguous(),
         source_points=points.contiguous(),
     )
 
@@ -111,8 +111,8 @@ def test_single_mls_accepts_noncontiguous_inputs_and_preserves_gradients():
     assert not displaced.is_contiguous()
     assert not features.is_contiguous()
 
-    actual = torchbvh.bvh_mls_interpolate(points, displaced, features, k=8)
-    expected = torchbvh.bvh_mls_interpolate(
+    actual = torchbvh.mls_interpolate(points, displaced, features, k=8)
+    expected = torchbvh.mls_interpolate(
         points.contiguous(),
         displaced.contiguous(),
         features.contiguous(),
@@ -137,8 +137,8 @@ def test_batched_mls_accepts_noncontiguous_inputs_and_preserves_gradients():
     assert not displaced.is_contiguous()
     assert not features.is_contiguous()
 
-    actual = torchbvh.bvh_mls_interpolate_batched(points, displaced, features, k=8)
-    expected = torchbvh.bvh_mls_interpolate_batched(
+    actual = torchbvh.mls_interpolate(points, displaced, features, k=8)
+    expected = torchbvh.mls_interpolate(
         points.contiguous(),
         displaced.contiguous(),
         features.contiguous(),
@@ -192,7 +192,7 @@ def test_bvh_classes_store_contiguous_points_for_later_operations():
     with BVH(points) as bvh:
         actual = bvh.interpolate(displaced, features, k=8)
 
-    expected = torchbvh.bvh_mls_interpolate(
+    expected = torchbvh.mls_interpolate(
         points.contiguous(),
         displaced.contiguous(),
         features.contiguous(),
@@ -202,10 +202,10 @@ def test_bvh_classes_store_contiguous_points_for_later_operations():
 
     batched_points = _noncontiguous_float((2, 32, 3))
     batched_queries = _noncontiguous_float((2, 7, 3), fill=batched_points[:, :7, :] + 0.01)
-    with BatchedBVH(batched_points) as bvh:
+    with BVH(batched_points) as bvh:
         idx, dist = bvh.knn(batched_queries, 4)
-    expected_bvh = torchbvh.build_bvh_batched(batched_points.contiguous())
-    expected_idx, expected_dist = torchbvh.query_knn_batched(expected_bvh, batched_queries.contiguous(), 4)
+    expected_bvh = torchbvh.build_bvh(batched_points.contiguous())
+    expected_idx, expected_dist = torchbvh.query_knn(expected_bvh, batched_queries.contiguous(), 4)
     torch.testing.assert_close(idx, expected_idx)
     torch.testing.assert_close(dist, expected_dist)
     torchbvh.destroy_bvh(expected_bvh)
@@ -214,14 +214,14 @@ def test_bvh_classes_store_contiguous_points_for_later_operations():
     offsets = _noncontiguous_int64([0, 9, 24])
     q_offsets = _noncontiguous_int64([0, 4, 10])
     ragged_queries = _noncontiguous_float((10, 2), fill=ragged_points[:10] + 0.01)
-    with RaggedBVH(ragged_points, offsets) as bvh:
+    with BVH(ragged_points, batch_offsets=offsets) as bvh:
         idx, dist = bvh.knn(ragged_queries, 4, query_offsets=q_offsets)
-    expected_bvh = torchbvh.build_bvh_ragged(ragged_points.contiguous(), offsets.contiguous())
-    expected_idx, expected_dist = torchbvh.query_knn_ragged(
+    expected_bvh = torchbvh.build_bvh(ragged_points.contiguous(), batch_offsets=offsets.contiguous())
+    expected_idx, expected_dist = torchbvh.query_knn(
         expected_bvh,
         ragged_queries.contiguous(),
-        q_offsets.contiguous(),
         4,
+        query_offsets=q_offsets.contiguous(),
     )
     torch.testing.assert_close(idx, expected_idx)
     torch.testing.assert_close(dist, expected_dist)
@@ -230,13 +230,13 @@ def test_bvh_classes_store_contiguous_points_for_later_operations():
 
 def test_fps_accepts_noncontiguous_single_and_batched_points():
     points = _noncontiguous_float((32, 3))
-    actual = torchbvh.fps(points, 8, mode="exact_full_scan")
-    expected = torchbvh.fps(points.contiguous(), 8, mode="exact_full_scan")
+    actual = torchbvh.fps(points, 8)
+    expected = torchbvh.fps(points.contiguous(), 8)
     torch.testing.assert_close(actual.indices, expected.indices)
     torch.testing.assert_close(actual.points, expected.points)
 
     batched = _noncontiguous_float((2, 32, 3))
-    actual_batched = torchbvh.fps(batched, 8, mode="exact_full_scan")
-    expected_batched = torchbvh.fps(batched.contiguous(), 8, mode="exact_full_scan")
+    actual_batched = torchbvh.fps(batched, 8)
+    expected_batched = torchbvh.fps(batched.contiguous(), 8)
     torch.testing.assert_close(actual_batched.indices, expected_batched.indices)
     torch.testing.assert_close(actual_batched.points, expected_batched.points)

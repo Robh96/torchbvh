@@ -22,12 +22,12 @@ def _assert_ragged_matches_single_loop(
 ):
     batch_offsets = _offsets(point_counts)
     query_offsets = _offsets(query_counts)
-    bvh = torchbvh.build_bvh_ragged(points.contiguous(), batch_offsets)
-    indices, distances, positions = torchbvh.query_knn_ragged(
+    bvh = torchbvh.build_bvh(points.contiguous(), batch_offsets=batch_offsets)
+    indices, distances, positions = torchbvh.query_knn(
         bvh,
         queries.contiguous(),
-        query_offsets,
         k,
+        query_offsets=query_offsets,
         source_points=points.contiguous(),
     )
 
@@ -98,12 +98,12 @@ def _assert_ragged_true_tie_neighbors_are_valid(
 ):
     batch_offsets = _offsets(point_counts)
     query_offsets = _offsets(query_counts)
-    bvh = torchbvh.build_bvh_ragged(points.contiguous(), batch_offsets)
-    indices, distances, positions = torchbvh.query_knn_ragged(
+    bvh = torchbvh.build_bvh(points.contiguous(), batch_offsets=batch_offsets)
+    indices, distances, positions = torchbvh.query_knn(
         bvh,
         queries.contiguous(),
-        query_offsets,
         k,
+        query_offsets=query_offsets,
         source_points=points.contiguous(),
     )
 
@@ -329,12 +329,12 @@ def test_ragged_knn_indices_are_local_not_global_packed():
         ],
         dim=0,
     )
-    bvh = torchbvh.build_bvh_ragged(points.contiguous(), _offsets(point_counts))
-    indices, distances = torchbvh.query_knn_ragged(
+    bvh = torchbvh.build_bvh(points.contiguous(), batch_offsets=_offsets(point_counts))
+    indices, distances = torchbvh.query_knn(
         bvh,
         queries.contiguous(),
-        _offsets(query_counts),
         4,
+        query_offsets=_offsets(query_counts),
     )
 
     start = 0
@@ -365,13 +365,13 @@ def test_query_knn_ragged_neighbor_positions_gradients_flow_to_source_points_onl
         ],
         dim=0,
     ).contiguous().requires_grad_()
-    bvh = torchbvh.build_bvh_ragged(points, _offsets(point_counts))
+    bvh = torchbvh.build_bvh(points, batch_offsets=_offsets(point_counts))
 
-    indices, distances, neighbor_positions = torchbvh.query_knn_ragged(
+    indices, distances, neighbor_positions = torchbvh.query_knn(
         bvh,
         queries,
-        _offsets(query_counts),
         4,
+        query_offsets=_offsets(query_counts),
         source_points=points,
     )
 
@@ -388,10 +388,10 @@ def test_ragged_knn_rejects_unsupported_k():
     assert torch.cuda.is_available()
     points = torch.rand((16, 2), device="cuda", dtype=torch.float32).contiguous()
     offsets = torch.tensor([0, 8, 16], device="cuda", dtype=torch.int64)
-    bvh = torchbvh.build_bvh_ragged(points, offsets)
+    bvh = torchbvh.build_bvh(points, batch_offsets=offsets)
 
     with pytest.raises(ValueError, match="k must be 4, 8, or 16"):
-        torchbvh.query_knn_ragged(bvh, points, offsets, 5)
+        torchbvh.query_knn(bvh, points, 5, query_offsets=offsets)
 
 
 def test_ragged_knn_rejects_invalid_handle_type():
@@ -400,9 +400,9 @@ def test_ragged_knn_rejects_invalid_handle_type():
     single_bvh = torchbvh.build_bvh(points)
 
     with pytest.raises(TypeError, match="RaggedBVHHandle"):
-        torchbvh.query_knn_ragged(
+        torchbvh.query_knn(
             single_bvh,
             points,
-            torch.tensor([0, 8], device="cuda", dtype=torch.int64),
             4,
+            query_offsets=torch.tensor([0, 8], device="cuda", dtype=torch.int64),
         )

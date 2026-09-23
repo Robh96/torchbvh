@@ -1,11 +1,7 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
-from torchbvh._mls import (
-    _linear_mls_chunk,
-    _linear_mls_fused_forward,
-)
 
 
 def _make_cloud(dim: int):
@@ -39,7 +35,7 @@ def test_bvh_mls_interpolate_public_shapes_and_gradients(dim, k):
     displaced_points = (points[3:11] + 0.02).contiguous().requires_grad_()
     features = features.clone().requires_grad_()
 
-    interpolated, field_gradient = torchbvh.bvh_mls_interpolate(
+    interpolated, field_gradient = torchbvh.mls_interpolate(
         points,
         displaced_points,
         features,
@@ -62,7 +58,7 @@ def test_bvh_mls_interpolate_batched_default_returns_tensor_not_tuple():
     points, features = _make_batched_cloud(3)
     displaced_points = (points[:, 3:7, :] + 0.02).contiguous()
 
-    result = torchbvh.bvh_mls_interpolate_batched(points, displaced_points, features)
+    result = torchbvh.mls_interpolate(points, displaced_points, features)
 
     assert isinstance(result, torch.Tensor)
     assert result.shape == (2, 4, features.shape[-1])
@@ -73,49 +69,13 @@ def test_bvh_mls_interpolate_batched_return_grad_true_returns_tuple_with_correct
     points, features = _make_batched_cloud(3)
     displaced_points = (points[:, 3:7, :] + 0.02).contiguous()
 
-    result = torchbvh.bvh_mls_interpolate_batched(points, displaced_points, features, k=8, return_grad=True)
+    result = torchbvh.mls_interpolate(points, displaced_points, features, k=8, return_grad=True)
 
     assert isinstance(result, tuple)
     assert len(result) == 2
     interpolated, field_gradient = result
     assert interpolated.shape == (2, 4, features.shape[-1])
     assert field_gradient.shape == (2, 4, 3, features.shape[-1])
-
-
-def test_fused_forward_matches_reference_chunk_on_same_neighbors():
-    assert torch.cuda.is_available()
-    torch.manual_seed(123)
-    points = torch.randn((32, 3), device="cuda", dtype=torch.float32).contiguous()
-    displaced_points = (points[:12] + 0.03 * torch.randn((12, 3), device="cuda")).contiguous()
-    features = torch.randn((32, 5), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh(points)
-    indices, squared_distances, neighbor_positions = torchbvh.query_knn(
-        bvh,
-        displaced_points,
-        8,
-        source_points=points,
-    )
-    neighbor_features = features[indices]
-
-    expected, expected_gradient = _linear_mls_chunk(
-        displaced_points,
-        neighbor_positions,
-        neighbor_features,
-        squared_distances,
-        return_grad=True,
-    )
-    actual, actual_gradient = _linear_mls_fused_forward(
-        displaced_points,
-        neighbor_positions,
-        indices,
-        squared_distances,
-        features,
-        return_grad=True,
-    )
-
-    torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=1.0e-2)
-    assert torch.isfinite(actual_gradient).all()
-    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0.25, atol=0.25)
 
 
 @pytest.mark.parametrize("dim,k", [(2, 4), (3, 8)])
@@ -143,7 +103,7 @@ def test_bvh_mls_interpolate_batched_heads_matches_per_head_loop_and_backpropaga
 
     expected = torch.stack(
         [
-            torchbvh.bvh_mls_interpolate_batched(
+            torchbvh.mls_interpolate(
                 points,
                 queries[:, :, head],
                 features[:, :, head],

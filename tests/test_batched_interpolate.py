@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
@@ -32,10 +32,10 @@ def test_batched_mls_matches_single_sample_loop(dim, k):
     points, features = _make_batched_cloud(dim=dim)
     displaced = (points[:, 3:11, :] + 0.02).contiguous()
 
-    actual = torchbvh.bvh_mls_interpolate_batched(points, displaced, features, k=k)
+    actual = torchbvh.mls_interpolate(points, displaced, features, k=k)
     expected = torch.stack(
         [
-            torchbvh.bvh_mls_interpolate(
+            torchbvh.mls_interpolate(
                 points[batch].contiguous(),
                 displaced[batch].contiguous(),
                 features[batch].contiguous(),
@@ -49,81 +49,65 @@ def test_batched_mls_matches_single_sample_loop(dim, k):
     torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-5)
 
 
-def test_public_mls_interpolate_reaches_fused_cuda_mls_boundary(monkeypatch):
+def test_public_mls_interpolate_reaches_spatial_indexed_mls_boundary(monkeypatch):
     assert torch.cuda.is_available()
     points, features = _make_batched_cloud(batch_size=2, n=12, dim=3)
     displaced = (points[:, 2:7, :] + 0.02).contiguous()
     calls = []
 
-    def fake_batched_query(points_arg, displaced_arg, k_arg):
-        batch_size, query_count, dim = displaced_arg.shape
-        k = int(k_arg)
-        calls.append(("query", points_arg.shape, displaced_arg.shape, k))
-        indices = torch.zeros((batch_size, query_count, k), device=points_arg.device, dtype=torch.int64)
-        distances = torch.zeros((batch_size, query_count, k), device=points_arg.device, dtype=torch.float32)
-        positions = torch.zeros((batch_size, query_count, k, dim), device=points_arg.device, dtype=torch.float32)
-        return indices, distances, positions
-
-    def fake_fused_forward(
+    def fake_spatial_indexed(
         displaced_arg,
-        neighbor_positions,
+        source_points,
         indices,
         squared_distances,
-        features_arg,
-        feature_batch=None,
+        feature_bank,
+        query_order,
         *,
+        queries_per_batch,
+        queries_per_head,
         return_grad,
-        return_aux=False,
     ):
         calls.append(
             (
-                "fused",
+                "spatial_indexed",
                 displaced_arg.shape,
-                neighbor_positions.shape,
+                source_points.shape,
                 indices.shape,
                 squared_distances.shape,
-                features_arg.shape,
-                None if feature_batch is None else feature_batch.shape,
+                feature_bank.shape,
+                query_order.shape,
+                queries_per_batch,
+                queries_per_head,
                 return_grad,
-                return_aux,
             )
         )
         output = torch.zeros(
-            (displaced_arg.size(0), features_arg.size(-1)),
-            device=features_arg.device,
-            dtype=features_arg.dtype,
+            (displaced_arg.size(0), feature_bank.size(-1)),
+            device=feature_bank.device,
+            dtype=feature_bank.dtype,
         )
-        if return_aux:
-            dim = displaced_arg.size(1)
-            return (
-                output,
-                torch.zeros((displaced_arg.size(0), dim, features_arg.size(-1)), device=features_arg.device),
-                torch.zeros((displaced_arg.size(0), dim + 1, dim + 1), device=features_arg.device),
-                torch.zeros((displaced_arg.size(0),), device=features_arg.device),
-            )
         if return_grad:
             return output, torch.zeros(
-                (displaced_arg.size(0), displaced_arg.size(1), features_arg.size(-1)),
-                device=features_arg.device,
+                (displaced_arg.size(0), displaced_arg.size(1), feature_bank.size(-1)),
+                device=feature_bank.device,
             )
         return output
 
-    monkeypatch.setattr(mls_module.BatchedBVHQuery, "apply", staticmethod(fake_batched_query))
-    monkeypatch.setattr(mls_module, "_linear_mls_fused_forward", fake_fused_forward)
+    monkeypatch.setattr(mls_module, "_linear_mls_spatial_indexed", fake_spatial_indexed)
 
     result = torchbvh.mls_interpolate(points, displaced, features, k=8)
 
     assert result.shape == (2, 5, 2)
-    assert [call[0] for call in calls] == ["query", "fused"]
-    assert calls[0][1:] == (points.shape, displaced.shape, 8)
-    assert calls[1][1] == (10, 3)
-    assert calls[1][2] == (10, 8, 3)
-    assert calls[1][3] == (10, 8)
-    assert calls[1][4] == (10, 8)
-    assert calls[1][5] == features.shape
-    assert calls[1][6] == (10,)
-    assert calls[1][7] is False
-    assert calls[1][8] is False
+    assert [call[0] for call in calls] == ["spatial_indexed"]
+    assert calls[0][1] == (10, 3)
+    assert calls[0][2] == points.shape
+    assert calls[0][3] == (10, 8)
+    assert calls[0][4] == (10, 8)
+    assert calls[0][5] == (2, 12, 2)
+    assert calls[0][6] == (10,)
+    assert calls[0][7] == 5
+    assert calls[0][8] == 5
+    assert calls[0][9] is False
 
 
 def test_batched_mls_gradient_boundary():
@@ -133,7 +117,7 @@ def test_batched_mls_gradient_boundary():
     displaced = (points.detach()[:, 3:11, :] + 0.02).contiguous().requires_grad_()
     features = features.detach().requires_grad_()
 
-    interpolated, field_gradient = torchbvh.bvh_mls_interpolate_batched(
+    interpolated, field_gradient = torchbvh.mls_interpolate(
         points,
         displaced,
         features,
@@ -158,6 +142,6 @@ def test_batched_mls_accepts_non_contiguous_inputs():
     padded[..., : points.shape[-1]] = points
     points_non_contiguous = padded[..., : points.shape[-1]]
 
-    expected = torchbvh.bvh_mls_interpolate_batched(points, displaced, features)
-    actual = torchbvh.bvh_mls_interpolate_batched(points_non_contiguous, displaced, features)
+    expected = torchbvh.mls_interpolate(points, displaced, features)
+    actual = torchbvh.mls_interpolate(points_non_contiguous, displaced, features)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)

@@ -1,9 +1,10 @@
-﻿import pytest
+import importlib.util
+
+import pytest
 import torch
 
 import torchbvh
 import torchbvh._query as query_module
-import torchbvh._reorder as reorder_module
 
 
 @pytest.mark.parametrize("dim", [2, 3])
@@ -46,16 +47,14 @@ def test_python_api_rejects_unsupported_k_with_public_message():
         torchbvh.query_knn(bvh, points.contiguous(), 5)
 
 
-def test_python_api_preserves_legacy_mapping_query_path():
+def test_python_api_rejects_plain_mapping_query_path():
     assert torch.cuda.is_available()
     points = torch.rand((16, 3), device="cuda", dtype=torch.float32)
     bvh = torchbvh.build_bvh(points.contiguous())
     legacy_bvh = dict(bvh)
 
-    indices, distances = torchbvh.query_knn(legacy_bvh, points[:3].contiguous(), 4)
-
-    assert indices.shape == (3, 4)
-    assert distances.shape == (3, 4)
+    with pytest.raises(TypeError, match="BVHHandle"):
+        torchbvh.query_knn(legacy_bvh, points[:3].contiguous(), 4)
 
 
 def test_query_knn_sort_queries_true_uses_ordered_traversal(monkeypatch):
@@ -69,23 +68,23 @@ def test_query_knn_sort_queries_true_uses_ordered_traversal(monkeypatch):
         calls.append(("sort", query_batch.shape, scene_min.shape, scene_max.shape))
         batch_size, query_count, _ = query_batch.shape
         perm = torch.arange(query_count, device=query_batch.device, dtype=torch.int64).expand(batch_size, query_count)
-        return perm.contiguous(), perm.contiguous()
+        return perm.contiguous()
 
     def fake_ordered(*args):
         calls.append(("ordered", args[2].shape, args[3].shape, args[-1]))
-        query_count = args[2].size(0)
+        batch_size, query_count, _ = args[2].shape
         k = int(args[-1])
         return (
-            torch.zeros((query_count, k), device=args[2].device, dtype=torch.int64),
-            torch.zeros((query_count, k), device=args[2].device, dtype=torch.float32),
+            torch.zeros((batch_size, query_count, k), device=args[2].device, dtype=torch.int64),
+            torch.zeros((batch_size, query_count, k), device=args[2].device, dtype=torch.float32),
         )
 
     def fake_unordered(*args):
         raise AssertionError("unordered query route should not be used when sort_queries=True")
 
-    monkeypatch.setattr(reorder_module, "morton_sort_queries_batched", fake_sort_queries)
-    monkeypatch.setattr(query_module._C, "query_knn_ordered", fake_ordered)
-    monkeypatch.setattr(query_module._C, "query_knn", fake_unordered)
+    monkeypatch.setattr(query_module._C, "morton_sort_queries_narrow", fake_sort_queries)
+    monkeypatch.setattr(query_module._C, "query_knn_batched_cached_bounds_ordered", fake_ordered)
+    monkeypatch.setattr(query_module._C, "query_knn_batched_cached_bounds", fake_unordered)
 
     indices, distances = torchbvh.query_knn(bvh, queries, 4, sort_queries=True)
 
@@ -93,13 +92,13 @@ def test_query_knn_sort_queries_true_uses_ordered_traversal(monkeypatch):
     assert distances.shape == (5, 4)
     assert [call[0] for call in calls] == ["sort", "ordered"]
     assert calls[0][1] == (1, 5, 3)
-    assert calls[1][1] == (5, 3)
-    assert calls[1][2] == (5,)
+    assert calls[1][1] == (1, 5, 3)
+    assert calls[1][2] == (1, 5)
     assert calls[1][3] == 4
 
 
 def test_python_api_rejects_invalid_handle_type():
-    with pytest.raises(TypeError, match="BVHHandle or mapping"):
+    with pytest.raises(TypeError, match="BVHHandle"):
         torchbvh.query_knn(object(), torch.empty((0, 2)), 4)
 
 
@@ -113,16 +112,14 @@ def test_bvh_handle_idempotent_double_destroy():
     assert bvh.destroyed
 
 
-def test_destroy_bvh_accepts_legacy_plain_dict():
+def test_destroy_bvh_rejects_plain_dict():
     assert torch.cuda.is_available()
     points = torch.rand((12, 3), device="cuda", dtype=torch.float32).contiguous()
     bvh = torchbvh.build_bvh(points)
     legacy = dict(bvh)
-    assert not legacy.get("_destroyed", False)
-    torchbvh.destroy_bvh(legacy)
-    assert legacy.get("_destroyed") is True
-    with pytest.raises(RuntimeError, match="destroyed"):
-        torchbvh.query_knn(legacy, points[:3].contiguous(), 4)
+    with pytest.raises(TypeError, match="handle returned by build_bvh"):
+        torchbvh.destroy_bvh(legacy)
+    assert not bvh.destroyed
 
 
 def test_bvh_handles_have_traversal_fields():
@@ -133,7 +130,7 @@ def test_bvh_handles_have_traversal_fields():
         assert key in single, f"BVHHandle missing key: {key}"
         assert single[key].dtype == torch.int32
     batched_pts = torch.rand((2, 16, 3), device="cuda", dtype=torch.float32).contiguous()
-    batched = torchbvh.build_bvh_batched(batched_pts)
+    batched = torchbvh.build_bvh(batched_pts)
     for key in ("left_child_mem", "mem_to_leaf"):
         assert key in batched, f"BatchedBVHHandle missing key: {key}"
         assert batched[key].dtype == torch.int32
@@ -161,24 +158,42 @@ def test_public_package_surface_after_cleanup():
         "SUPPORTED_K",
         "SUPPORTED_DIMS",
     }
-    expected_compatibility = {
+    removed = {
         "BatchedBVH",
         "RaggedBVH",
         "build_bvh_batched",
+        "build_bvh_ragged",
         "query_knn_batched",
+        "query_knn_ragged",
+        "bvh_mls_interpolate",
         "bvh_mls_interpolate_batched",
-    }
-    removed = {
+        "BVHQuery",
+        "BatchedBVHQuery",
+        "smoke_add_one",
+        "implicit_tree_summary",
+        "implicit_tree_descendant",
+        "implicit_tree_ancestor",
+        "morton_split2",
+        "morton_split3",
+        "morton_encode_2d",
+        "morton_encode_3d",
+        "ops",
         "_linear_mls",
         "_linear_mls_batched",
     }
 
     exported = set(ibvh.__all__)
     assert expected_public <= exported
-    assert expected_compatibility <= exported
     assert removed.isdisjoint(exported)
     for name in removed:
         assert not hasattr(ibvh, name)
+    assert importlib.util.find_spec("torchbvh.ops") is None
+    for name in (
+        "smoke_add_one",
+        "implicit_tree_summary",
+        "morton_encode_2d",
+    ):
+        assert not hasattr(ibvh._C, name)
 
 
 def test_recommended_public_workflow_smoke():

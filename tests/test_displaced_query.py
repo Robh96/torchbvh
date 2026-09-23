@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
@@ -115,8 +115,8 @@ def test_query_displaced_knn_matches_flattened_query_knn_batched():
     batch_size, n, heads, dim = q.shape
     flat_queries = q.reshape(batch_size, n * heads, dim).contiguous()
 
-    bvh = torchbvh.build_bvh_batched(pos)
-    flat_indices, flat_distances, flat_positions = torchbvh.query_knn_batched(
+    bvh = torchbvh.build_bvh(pos)
+    flat_indices, flat_distances, flat_positions = torchbvh.query_knn(
         bvh,
         flat_queries,
         8,
@@ -139,7 +139,7 @@ def test_query_displaced_knn_builds_one_bvh_per_sample_and_flattens_only_queries
 
     def fake_build_bvh_batched(points_arg):
         calls.append(("build", points_arg.shape, points_arg.requires_grad))
-        return {"_batched": True}
+        return torchbvh.BatchedBVHHandle({})
 
     def fake_query_knn_batched(bvh, query_points, k, *, source_points=None, sort_queries=True):
         calls.append(
@@ -159,8 +159,8 @@ def test_query_displaced_knn_builds_one_bvh_per_sample_and_flattens_only_queries
         positions = torch.zeros((batch_size, query_count, k, dim), device=query_points.device, dtype=torch.float32)
         return indices, distances, positions
 
-    monkeypatch.setattr(multihead_module, "build_bvh_batched", fake_build_bvh_batched)
-    monkeypatch.setattr(multihead_module, "query_knn_batched", fake_query_knn_batched)
+    monkeypatch.setattr(multihead_module, "_build_bvh_batched", fake_build_bvh_batched)
+    monkeypatch.setattr(multihead_module, "_query_knn_batched", fake_query_knn_batched)
 
     indices, distances, positions = torchbvh.query_displaced_knn(pos.requires_grad_(), q.requires_grad_(), 4)
 
@@ -272,9 +272,9 @@ def test_displaced_robust_geometry_matches_flattened_batched_oracles(dim, k):
     pos, q, values = _robust_displaced_query_inputs(dim=dim, k=k)
     batch_size, n, heads, _ = q.shape
 
-    bvh = torchbvh.build_bvh_batched(pos)
+    bvh = torchbvh.build_bvh(pos)
     flat_q = q.reshape(batch_size, n * heads, dim).contiguous()
-    flat_indices, flat_distances, flat_positions = torchbvh.query_knn_batched(
+    flat_indices, flat_distances, flat_positions = torchbvh.query_knn(
         bvh,
         flat_q,
         k,

@@ -1,7 +1,10 @@
-﻿import pytest
+import pytest
 import torch
 
 import torchbvh
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is required for k-NN tests", allow_module_level=True)
 
 
 def _brute_force_knn(points: torch.Tensor, query_points: torch.Tensor, k: int):
@@ -363,7 +366,7 @@ def test_knn_rejects_unsupported_k():
 
 
 def test_knn_rejects_invalid_handle_type():
-    with pytest.raises(TypeError, match="BVHHandle or mapping"):
+    with pytest.raises(TypeError, match="BVHHandle"):
         torchbvh.query_knn(object(), torch.empty((4, 2)), 4)
 
 
@@ -393,16 +396,16 @@ def test_batched_knn_sorted_query_path_matches_unsorted(dim, k):
     torch.manual_seed(3200 + dim * 10 + k)
     points = torch.rand((3, 257, dim), device="cuda", dtype=torch.float32).contiguous()
     queries = torch.rand((3, 123, dim), device="cuda", dtype=torch.float32).contiguous()
-    bvh = torchbvh.build_bvh_batched(points)
+    bvh = torchbvh.build_bvh(points)
 
-    idx, dist = torchbvh.query_knn_batched(bvh, queries, k, sort_queries=False)
-    idx_sorted, dist_sorted = torchbvh.query_knn_batched(
+    idx, dist = torchbvh.query_knn(bvh, queries, k, sort_queries=False)
+    idx_sorted, dist_sorted = torchbvh.query_knn(
         bvh,
         queries,
         k,
         sort_queries=True,
     )
-    idx_default, dist_default = torchbvh.query_knn_batched(bvh, queries, k)
+    idx_default, dist_default = torchbvh.query_knn(bvh, queries, k)
 
     torch.testing.assert_close(dist_sorted, dist)
     torch.testing.assert_close(idx_sorted, idx)

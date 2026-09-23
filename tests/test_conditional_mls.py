@@ -2,7 +2,6 @@ import pytest
 import torch
 
 import torchbvh
-from torchbvh._conditional import _query_knn_routed_batched
 
 
 def _inputs(dim=3, k=4, *, noncontiguous=False):
@@ -144,52 +143,6 @@ def test_conditional_accepts_noncontiguous_inputs():
     result = _call(args)
     assert result.shape == (*args[0].shape, args[3].size(-1))
     assert torch.isfinite(result).all()
-
-
-@pytest.mark.parametrize("dim", [2, 3])
-def test_private_routed_knn_matches_exact_branch_queries_and_offsets(dim):
-    args = _inputs(dim, 4)
-    mask, tp, tq, _, fp, fq, _ = args
-    B, M, H = mask.shape
-    selected = torch.where(mask[..., None], tq, fq).permute(0, 2, 1, 3).reshape(B, H * M, dim).contiguous()
-    routes = mask.permute(0, 2, 1).reshape(B, H * M).contiguous()
-    true_bvh = torchbvh.build_bvh_batched(tp.contiguous())
-    false_bvh = torchbvh.build_bvh_batched(fp.contiguous())
-    try:
-        indices, distances = _query_knn_routed_batched(true_bvh, false_bvh, selected, routes, 4)
-    finally:
-        torchbvh.destroy_bvh(true_bvh)
-        torchbvh.destroy_bvh(false_bvh)
-
-    true_dist, true_idx = torch.cdist(selected, tp).square().topk(4, largest=False)
-    false_dist, false_idx = torch.cdist(selected, fp).square().topk(4, largest=False)
-    expected_dist = torch.where(routes[..., None], true_dist, false_dist)
-    expected_idx = torch.where(routes[..., None], true_idx, false_idx + tp.size(1))
-    torch.testing.assert_close(distances, expected_dist, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(indices, expected_idx)
-
-
-def test_private_routed_knn_rejects_destroyed_or_incompatible_handles():
-    args = _inputs(2, 4)
-    mask, tp, tq, _, fp, _, _ = args
-    queries = tq.permute(0, 2, 1, 3).reshape(2, -1, 2).contiguous()
-    routes = mask.permute(0, 2, 1).reshape(2, -1).contiguous()
-    true_bvh = torchbvh.build_bvh_batched(tp.contiguous())
-    false_bvh = torchbvh.build_bvh_batched(fp.contiguous())
-    torchbvh.destroy_bvh(true_bvh)
-    with pytest.raises(RuntimeError, match="destroyed"):
-        _query_knn_routed_batched(true_bvh, false_bvh, queries, routes, 4)
-    torchbvh.destroy_bvh(false_bvh)
-
-    true_bvh = torchbvh.build_bvh_batched(tp.contiguous())
-    wrong_false = torchbvh.build_bvh_batched(
-        torch.randn((2, fp.size(1), 3), device="cuda"))
-    try:
-        with pytest.raises(RuntimeError, match="scene bound"):
-            _query_knn_routed_batched(true_bvh, wrong_false, queries, routes, 4)
-    finally:
-        torchbvh.destroy_bvh(true_bvh)
-        torchbvh.destroy_bvh(wrong_false)
 
 
 @pytest.mark.parametrize(
