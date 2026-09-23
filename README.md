@@ -1,19 +1,19 @@
-<h1 align="center"><img src="docs/assets/torchbvh-logo.svg" alt="torchbvh" width="800"></h1>
+<h1 align="center"><img src="https://raw.githubusercontent.com/Robh96/torchbvh/main/docs/assets/torchbvh-logo.svg" alt="torchbvh" width="800"></h1>
 
 **GPU geometry for PyTorch point clouds.** Fast k-NN, farthest-point sampling, interpolation, and ray tracing.
 
 [![PyPI version](https://img.shields.io/pypi/v/torchbvh?label=PyPI&color=3855A5)](https://pypi.org/project/torchbvh/)
 [![Python versions](https://img.shields.io/pypi/pyversions/torchbvh?color=3B7DBF)](https://pypi.org/project/torchbvh/)
 [![Documentation](https://img.shields.io/readthedocs/torchbvh/latest?label=docs&color=17A398)](https://torchbvh.readthedocs.io/en/latest/)
-[![License](https://img.shields.io/pypi/l/torchbvh?color=77C043)](LICENSE)
+[![License](https://img.shields.io/pypi/l/torchbvh?color=77C043)](https://github.com/Robh96/torchbvh/blob/main/LICENSE)
 
-[Documentation](https://torchbvh.readthedocs.io/en/latest/) · [API reference](docs/api_reference.md) · [Benchmarks](examples/third_party_benchmarks.ipynb)
+[Documentation](https://torchbvh.readthedocs.io/en/latest/) · [API reference](https://github.com/Robh96/torchbvh/blob/main/docs/api_reference.md) · [Benchmarks](https://github.com/Robh96/torchbvh/blob/main/examples/third_party_benchmarks.ipynb)
 
 ## Performance
 
 **20x faster k-NN** than `torch_cluster` GPU and **9.2x faster approximate FPS** than `fpsample` CPU, averaged across all 20 benchmark workloads.
 
-![Batched 3D benchmark: torchbvh k-NN and FPS compared with third-party libraries; interpolation on a regular grid provides context.](docs/assets/performance_story.svg)
+![Batched 3D benchmark: torchbvh k-NN and FPS compared with third-party libraries; interpolation on a regular grid provides context.](https://raw.githubusercontent.com/Robh96/torchbvh/main/docs/assets/performance_story.svg)
 
 
 ## About
@@ -33,7 +33,7 @@ Install CUDA-enabled PyTorch, a matching CUDA toolkit with NVCC, and a supported
 pip install torchbvh
 ```
 
-See the [build guide](docs/testing.md) for compiler and source-install details.
+See the [build guide](https://github.com/Robh96/torchbvh/blob/main/docs/testing.md) for compiler and source-install details.
 
 ## Quickstart
 
@@ -52,8 +52,8 @@ features = torch.rand(10_000, 64, device="cuda")
 values = tb.mls_interpolate(points, queries, features, k=4)
 ```
 
-See the [examples](docs/examples.md) for exact FPS, ray tracing, and gradients.
+See the [examples](https://github.com/Robh96/torchbvh/blob/main/docs/examples.md) for exact FPS, ray tracing, and gradients.
 
 ## References
 
-The BVH implementation builds on [Chitalu, Dubach, and Komura (2020)](https://doi.org/10.1111/cgf.13948) and [ImplicitBVH.jl](https://github.com/StellaOrg/ImplicitBVH.jl). Released under the [MIT license](LICENSE).
+The BVH implementation builds on [Chitalu, Dubach, and Komura (2020)](https://doi.org/10.1111/cgf.13948) and [ImplicitBVH.jl](https://github.com/StellaOrg/ImplicitBVH.jl). Released under the [MIT license](https://github.com/Robh96/torchbvh/blob/main/LICENSE).

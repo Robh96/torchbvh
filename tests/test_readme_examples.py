@@ -7,6 +7,15 @@ import pytest
 import torch
 
 
+def test_readme_links_are_absolute_for_pypi():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    urls = re.findall(r"\]\(([^)\s]+)\)", readme)
+    urls += re.findall(r'<(?:img|a)\b[^>]*\b(?:src|href)="([^"]+)"', readme)
+
+    assert urls
+    assert all(url.startswith("https://") for url in urls)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_readme_quickstart_runs_end_to_end():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")

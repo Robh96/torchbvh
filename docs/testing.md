@@ -41,11 +41,11 @@ Inspect the sdist for all `csrc` sources, with no research files or generated ar
 
 ```bash
 python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation dist/torchbvh-0.3.0.tar.gz
+python -m pip install --no-build-isolation dist/torchbvh-0.3.1.tar.gz
 python -m pip check
 ```
 
-Then run an import and the public examples. Version 0.3.0 does not publish a prebuilt wheel: a wheel compiled against one PyTorch/CUDA/GPU combination is not generally safe to offer to other combinations.
+Then run an import and the public examples. The release does not publish a prebuilt wheel: a wheel compiled against one PyTorch/CUDA/GPU combination is not generally safe to offer to other combinations.
 
 Run the maintained core benchmark on the same GPU and input sizes for the baseline and release candidate. Compare exact outputs and approximate-FPS quality before accepting timings. Finally, build documentation with strict link
 checking:
