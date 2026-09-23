@@ -27,13 +27,13 @@
 
 ## Installation
 
-Install CUDA-enabled PyTorch, a matching CUDA toolkit with NVCC, and a supported C++ compiler. To use the current code in this checkout:
+Install CUDA-enabled PyTorch, a matching CUDA toolkit with NVCC, and a supported C++ compiler, then install `torchbvh`:
 
 ```bash
-python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation .
+pip install torchbvh
 ```
 
+See the [build guide](docs/testing.md) for compiler and source-install details.
 
 ## Quickstart
 

@@ -8,14 +8,20 @@ The production routes use cooperative BVH construction, cached-bound k-NN, index
 
 ## Install
 
-Install CUDA-enabled PyTorch for your GPU, the matching CUDA toolkit (including NVCC), and a supported host C++ compiler. Then compile `torchbvh` against the PyTorch already installed in your environment:
+Install CUDA-enabled PyTorch for your GPU, the matching CUDA toolkit (including NVCC), and a supported host C++ compiler. Then install `torchbvh`:
+
+```bash
+pip install torchbvh
+```
+
+To install from a local source checkout instead:
 
 ```bash
 python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation --no-binary torchbvh torchbvh
+python -m pip install --no-build-isolation .
 ```
 
-`torchbvh` is CUDA-only. Version 0.3.0 is distributed as source rather than as a GPU-specific wheel. PyTorch targets the GPUs visible while building by default; set `TORCH_CUDA_ARCH_LIST` first to target a different or broader set.
+`torchbvh` is CUDA-only. Source installs compile against the PyTorch in your environment. PyTorch targets the GPUs visible while building by default; set `TORCH_CUDA_ARCH_LIST` first to target a different or broader set.
 See [Testing](testing.md) for build and verification guidance.
 
 ## Quickstart
