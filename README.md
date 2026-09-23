@@ -5,7 +5,7 @@ GPU-native geometry primitives for PyTorch workflows: BVH construction, exact k-
 ## Performance
 
 The production routes use cooperative BVH construction, cached-bound k-NN, indexed packed MLS, bucketed FPS, and specialized segment/general triangle ray traversal.
-Maintained benchmark commands are documented in [Performance](docs/performance.md).
+Maintained benchmark commands are documented in [Performance](https://torchbvh.readthedocs.io/en/latest/performance/).
 
 
 ## Install
