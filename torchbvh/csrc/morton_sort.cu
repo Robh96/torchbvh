@@ -12,6 +12,31 @@
 #include "morton.cuh"
 #include <cub/device/device_segmented_radix_sort.cuh>
 
+// Query ordering is a scheduling choice, not geometric quantization. Coarser
+// codes never change the coordinates passed to exact BVH traversal.
+template <int D>
+__global__ void routed_query_narrow_keys(
+    const float* queries, const bool* routes, uint32_t* codes, int* values,
+    int M, int total, const float* true_lo, const float* true_hi,
+    const float* false_lo, const float* false_hi, int spatial_bits
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int b = idx / M;
+    const bool route = routes[idx];
+    const float* q = queries + static_cast<int64_t>(idx) * D;
+    const float* lo = (route ? true_lo : false_lo) + b * D;
+    const float* hi = (route ? true_hi : false_hi) + b * D;
+    uint32_t code;
+    if constexpr (D == 2)
+        code = implicit_bvh::morton::morton_encode_2d(q[0], q[1], make_float2(lo[0], lo[1]), make_float2(hi[0], hi[1]));
+    else
+        code = implicit_bvh::morton::morton_encode_3d(q[0], q[1], q[2], make_float3(lo[0], lo[1], lo[2]), make_float3(hi[0], hi[1], hi[2]));
+    code >>= (D == 2 ? 32 : 30) - spatial_bits;
+    codes[idx] = code | (static_cast<uint32_t>(route) << spatial_bits);
+    values[idx] = idx - b * M;
+}
+
 
 // One thread per (b, m): write Morton code for queries[b, m, :] to codes[b*M + m].
 // Codes are stored as uint64_t (values fit in 30 or 32 bits; int64 storage in PyTorch).
@@ -302,3 +327,56 @@ torch::Tensor morton_sort_routed_queries_batched_cuda(
     return morton_sort_routed_queries_batched_impl<3>(
         queries, routes, true_scene_min, true_scene_max, false_scene_min, false_scene_max);
 }
+
+
+// Experimental ordering entry point; shares the validated exact traversal and
+// source geometry with the established 64-bit routed ordering path.
+torch::Tensor morton_sort_routed_queries_narrow_cuda(
+    torch::Tensor queries, torch::Tensor routes,
+    torch::Tensor true_min, torch::Tensor true_max,
+    torch::Tensor false_min, torch::Tensor false_max, int spatial_bits
+) {
+    const char* op = "morton_sort_routed_queries_narrow";
+    TORCH_CHECK(queries.is_cuda() && queries.is_contiguous() && queries.scalar_type() == torch::kFloat32,
+                op, ": queries must be contiguous CUDA float32");
+    TORCH_CHECK(queries.dim() == 3 && (queries.size(2) == 2 || queries.size(2) == 3), op, ": expected (B,M,2|3)");
+    TORCH_CHECK(queries.size(0) > 0 && queries.size(1) > 0 && queries.size(0)*queries.size(1) <= INT32_MAX,
+                op, ": query count must fit signed int32");
+    TORCH_CHECK(routes.is_cuda() && routes.is_contiguous() && routes.device() == queries.device()
+                && routes.scalar_type() == torch::kBool && routes.dim() == 2
+                && routes.size(0) == queries.size(0) && routes.size(1) == queries.size(1), op, ": invalid routes");
+    TORCH_CHECK(spatial_bits >= 1 && spatial_bits <= 30, op, ": spatial_bits must be in [1,30]");
+    for (const auto& bound : {true_min, true_max, false_min, false_max}) {
+        TORCH_CHECK(bound.is_cuda() && bound.device() == queries.device() && bound.is_contiguous()
+                    && bound.scalar_type() == torch::kFloat32 && bound.dim() == 2
+                    && bound.size(0) == queries.size(0) && bound.size(1) == queries.size(2), op, ": invalid bounds");
+    }
+    c10::cuda::CUDAGuard guard(queries.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int B = queries.size(0), M = queries.size(1), total = B*M;
+    auto opts = queries.options().dtype(torch::kInt32);
+    auto keys = torch::empty({total}, opts), keys_out = torch::empty_like(keys);
+    auto values = torch::empty_like(keys), values_out = torch::empty_like(keys);
+    auto offsets = torch::empty({B+1}, opts);
+    const int blocks = (total+255)/256;
+#define LAUNCH_KEYS(D) routed_query_narrow_keys<D><<<blocks,256,0,stream>>>(queries.data_ptr<float>(), routes.data_ptr<bool>(), reinterpret_cast<uint32_t*>(keys.data_ptr<int>()), values.data_ptr<int>(), M, total, true_min.data_ptr<float>(), true_max.data_ptr<float>(), false_min.data_ptr<float>(), false_max.data_ptr<float>(), spatial_bits)
+    if (queries.size(2) == 2) { LAUNCH_KEYS(2); } else { LAUNCH_KEYS(3); }
+#undef LAUNCH_KEYS
+    fill_offsets_i32_kernel<<<(B+256)/256,256,0,stream>>>(offsets.data_ptr<int>(),B,M);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    size_t bytes=0;
+    cub::DeviceSegmentedRadixSort::SortPairs(nullptr, bytes,
+        reinterpret_cast<uint32_t*>(keys.data_ptr<int>()), reinterpret_cast<uint32_t*>(keys_out.data_ptr<int>()),
+        values.data_ptr<int>(), values_out.data_ptr<int>(), total,B,offsets.data_ptr<int>(),offsets.data_ptr<int>()+1,
+        0,spatial_bits+1,stream);
+    auto temp=torch::empty({static_cast<int64_t>(bytes+1)},queries.options().dtype(torch::kByte));
+    cub::DeviceSegmentedRadixSort::SortPairs(temp.data_ptr(), bytes,
+        reinterpret_cast<uint32_t*>(keys.data_ptr<int>()), reinterpret_cast<uint32_t*>(keys_out.data_ptr<int>()),
+        values.data_ptr<int>(), values_out.data_ptr<int>(), total,B,offsets.data_ptr<int>(),offsets.data_ptr<int>()+1,
+        0,spatial_bits+1,stream);
+    auto order=torch::empty({B,M},queries.options().dtype(torch::kInt64));
+    widen_i32_kernel<<<blocks,256,0,stream>>>(values_out.data_ptr<int>(),order.data_ptr<int64_t>(),total);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return order;
+}
+#include "routed_queries.cuh"

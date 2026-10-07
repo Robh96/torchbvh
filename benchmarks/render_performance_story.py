@@ -1,12 +1,12 @@
 """Render the README performance graphic from a third-party benchmark CSV.
 
-Run the notebook's full sweep, then export its ``results`` DataFrame with
-``results.to_csv('artifacts/third_party_readme_2026-09-23.csv', index=False)``.
+Read a versioned merged CSV produced by ``benchmarks.refresh_torchbvh``.
+The renderer never runs benchmarks or changes the measured rows.
 
 Example:
     python benchmarks/render_performance_story.py \
-        artifacts/third_party_readme_2026-09-23.csv \
-        docs/assets/performance_story
+        benchmarks/results/third_party_0.3.2_2026-10-07.csv \
+        docs/assets/performance_story_032
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ def render(results: Path, output_stem: Path) -> None:
     fig.text(0.075, 0.177, "MLS works directly on scattered points.", color=TEXT,
              fontsize=21, weight="bold", va="top")
     fig.text(0.075, 0.135,
-             "On regular grids, grid_sample is faster.",
+             "grid_sample provides the regular-grid reference.",
              color=MUTED, fontsize=12.7, va="top")
     fig.text(0.625, 0.225, "REGULAR-GRID REFERENCE  /  MEDIAN MS", color=MUTED,
              fontsize=10.5, weight="bold", va="top")
@@ -179,8 +179,8 @@ def render(results: Path, output_stem: Path) -> None:
              weight="bold", ha="right", va="center")
 
     output_stem.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_stem.with_suffix(".svg"), bbox_inches=None)
-    fig.savefig(output_stem.with_suffix(".png"), dpi=180, bbox_inches=None)
+    fig.savefig(Path(str(output_stem) + ".svg"), bbox_inches=None)
+    fig.savefig(Path(str(output_stem) + ".png"), dpi=180, bbox_inches=None)
     plt.close(fig)
 
 

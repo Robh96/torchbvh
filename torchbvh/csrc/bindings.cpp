@@ -1,5 +1,44 @@
 #include <torch/extension.h>
 
+std::vector<torch::Tensor> mls_geometry_forward_cuda(
+    torch::Tensor queries, torch::Tensor sources, torch::Tensor indices, torch::Tensor distances,
+    torch::Tensor features, torch::Tensor false_features, torch::Tensor order, int per_batch, int per_head,
+    double regularization, double bandwidth_min, double exact_epsilon, bool slopes, bool query_major);
+std::vector<torch::Tensor> mls_geometry_backward_cuda(
+    torch::Tensor queries, torch::Tensor sources, torch::Tensor indices, torch::Tensor distances,
+    torch::Tensor features, torch::Tensor false_features, torch::Tensor order, torch::Tensor state,
+    torch::Tensor hits, torch::Tensor value_gradients, torch::Tensor slope_gradients,
+    int per_batch, int per_head, double bandwidth_min, double exact_epsilon,
+    bool query_major, bool need_queries, bool need_features);
+
+std::tuple<torch::Tensor, torch::Tensor> select_bvh_medoids_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+
+std::tuple<torch::Tensor, torch::Tensor> pack_routed_queries_cuda(torch::Tensor, torch::Tensor, torch::Tensor);
+std::tuple<torch::Tensor, torch::Tensor> unpack_routed_gradient_cuda(torch::Tensor, torch::Tensor, bool, bool);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> build_point_bins_cuda(torch::Tensor, torch::Tensor, torch::Tensor, int);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> query_knn_routed_bins_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int, int, int, int, int, int,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mls_routed_indexed_forward_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int, int, double, double, double, bool, int, bool, double, bool);
+std::tuple<torch::Tensor, torch::Tensor> mls_routed_indexed_backward_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int, int, double, double, int, bool, bool, bool, bool);
+
+std::tuple<torch::Tensor, torch::Tensor> query_knn_routed_explicit_cuda(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    int, int, int, int, int, int,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int);
+
 using BvhBuildResult = std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     int, int, int, int, int, int,
@@ -44,7 +83,7 @@ mls_packed_indexed_forward_cuda(
     torch::Tensor indices, torch::Tensor squared_distances,
     torch::Tensor features, torch::Tensor query_order,
     int queries_per_batch, int queries_per_head,
-    double regularization, double bandwidth_min, double exact_eps);
+    double regularization, double bandwidth_min, double exact_eps, bool return_grad);
 std::tuple<torch::Tensor, torch::Tensor> mls_packed_indexed_backward_cuda(
     torch::Tensor displaced_points, torch::Tensor source_points,
     torch::Tensor indices, torch::Tensor squared_distances,
@@ -121,7 +160,35 @@ pybind11::dict build_primitive_bvh_batched(torch::Tensor primitives) {
     return make_bvh_dict(build_primitive_bvh_batched_cuda(primitives));
 }
 
+torch::Tensor morton_sort_routed_queries_narrow_cuda(
+    torch::Tensor queries, torch::Tensor routes, torch::Tensor true_min, torch::Tensor true_max,
+    torch::Tensor false_min, torch::Tensor false_max, int spatial_bits);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mls_geometry_forward", &mls_geometry_forward_cuda);
+    m.def("mls_geometry_backward", &mls_geometry_backward_cuda);
+    m.def("select_bvh_medoids", &select_bvh_medoids_cuda);
+    m.def("pack_routed_queries", &pack_routed_queries_cuda);
+    m.def("unpack_routed_gradient", &unpack_routed_gradient_cuda);
+    m.def("build_point_bins", &build_point_bins_cuda);
+    m.def("query_knn_routed_bins", &query_knn_routed_bins_cuda);
+    m.def("mls_routed_indexed_forward", &mls_routed_indexed_forward_cuda,
+        py::arg("queries"), py::arg("sources"), py::arg("indices"), py::arg("distances"),
+        py::arg("features"), py::arg("false_features"), py::arg("order"),
+        py::arg("per_batch"), py::arg("per_head"), py::arg("regularization"),
+        py::arg("bandwidth_min"), py::arg("exact_eps"), py::arg("return_grad"),
+        py::arg("channel_tile"), py::arg("shared_coefficients"), py::arg("safe_ratio"),
+        py::arg("query_major_output") = false);
+    m.def("mls_routed_indexed_backward", &mls_routed_indexed_backward_cuda,
+        py::arg("queries"), py::arg("sources"), py::arg("indices"), py::arg("distances"),
+        py::arg("features"), py::arg("false_features"), py::arg("order"), py::arg("factors"),
+        py::arg("exact_counts"), py::arg("d_values"), py::arg("d_slopes"),
+        py::arg("per_batch"), py::arg("per_head"), py::arg("bandwidth_min"), py::arg("exact_eps"),
+        py::arg("channel_tile"), py::arg("query_major_output") = false,
+        py::arg("aggregate_scatter") = false,
+        py::arg("need_query") = true, py::arg("need_features") = true);
+    m.def("query_knn_routed_explicit", &query_knn_routed_explicit_cuda);
+    m.def("morton_sort_routed_queries_narrow", &morton_sort_routed_queries_narrow_cuda);
     m.def("build_bvh_batched_cooperative", &build_bvh_batched_cooperative);
     m.def("build_primitive_bvh_batched", &build_primitive_bvh_batched);
     m.def("morton_sort_points_batched", &morton_sort_points_batched_cuda);
@@ -132,7 +199,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("query_knn_batched_cached_bounds_spatial", &query_knn_batched_cached_bounds_spatial_cuda);
     m.def("query_knn_routed_batched_cached_bounds_spatial",
           &query_knn_routed_batched_cached_bounds_spatial_cuda);
-    m.def("mls_packed_indexed_forward", &mls_packed_indexed_forward_cuda);
+    m.def("mls_packed_indexed_forward", &mls_packed_indexed_forward_cuda,
+        pybind11::arg("displaced_points"), pybind11::arg("source_points"),
+        pybind11::arg("indices"), pybind11::arg("squared_distances"),
+        pybind11::arg("features"), pybind11::arg("query_order"),
+        pybind11::arg("queries_per_batch"), pybind11::arg("queries_per_head"),
+        pybind11::arg("regularization"), pybind11::arg("bandwidth_min"),
+        pybind11::arg("exact_eps"), pybind11::arg("return_grad") = true);
     m.def("mls_packed_indexed_backward", &mls_packed_indexed_backward_cuda);
     m.def("raytrace_batched", &raytrace_batched_cuda);
     m.def("raytrace_batched_cached", &raytrace_batched_cached_cuda);

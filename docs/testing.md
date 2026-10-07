@@ -41,7 +41,7 @@ Inspect the sdist for all `csrc` sources, with no research files or generated ar
 
 ```bash
 python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation dist/torchbvh-0.3.1.tar.gz
+python -m pip install --no-build-isolation dist/torchbvh-0.3.2.tar.gz
 python -m pip check
 ```
 
@@ -55,3 +55,20 @@ mkdocs build --strict
 ```
 
 CPU-only environments can still run syntax and static-reference checks, but cannot import the compiled extension or validate CUDA behavior.
+
+The blocking 0.3.2 contract suite and the retained legacy parity diagnostics are
+run separately:
+
+```bash
+python -m pytest -q -m "not legacy_gradient_parity"
+python -m pytest -q -m legacy_gradient_parity
+```
+
+The second command retains the original strict assertions and can fail because
+of the [documented FP32 accumulation differences](numerical_behavior.md).
+No marker is excluded by default: `python -m pytest -q` still runs everything.
+The blocking suite includes independent weighted-solve derivatives and qualifying
+kernel coverage for geometry lifetime, mutation, streams and CUDA graphs.
+Any unrelated correctness failure remains a release blocker.
+Publish only after the complete local diff and tested sdist are reviewed.
+Verify GitHub first, then upload that same source-only artifact through Twine.

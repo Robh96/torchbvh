@@ -11,9 +11,14 @@
 
 ## Performance
 
-**20x faster k-NN** than `torch_cluster` GPU and **9.2x faster approximate FPS** than `fpsample` CPU, averaged across all 20 benchmark workloads.
+**25.3x faster k-NN** than `torch_cluster` GPU and **9.2x faster approximate FPS** than `fpsample` CPU, averaged across all 20 benchmark workloads (arithmetic mean of per-workload ratios).
 
-![Batched 3D benchmark: torchbvh k-NN and FPS compared with third-party libraries; interpolation on a regular grid provides context.](https://raw.githubusercontent.com/Robh96/torchbvh/main/docs/assets/performance_story.svg)
+![torchbvh 0.3.2: batched 3D k-NN, FPS and regular-grid interpolation context.](https://raw.githubusercontent.com/Robh96/torchbvh/v0.3.2/docs/assets/performance_story_032.svg)
+
+torchbvh k-NN/MLS rows were refreshed on 2026-10-07; the 160 competitor,
+grid_sample and FPS rows retain their 2026-09-23 measurements. See the
+[benchmark protocol and data](https://github.com/Robh96/torchbvh/blob/main/benchmarks/README.md)
+and [MLS numerical behavior](https://github.com/Robh96/torchbvh/blob/main/docs/numerical_behavior.md).
 
 
 ## About
@@ -53,6 +58,22 @@ values = tb.mls_interpolate(points, queries, features, k=4)
 ```
 
 See the [examples](https://github.com/Robh96/torchbvh/blob/main/docs/examples.md) for exact FPS, ray tracing, and gradients.
+
+## Share point geometry within a forward
+
+```python
+other_queries = queries + 0.01
+with tb.PointGeometry(points) as geometry:
+    values = tb.mls_interpolate(points, queries, features, k=4, geometry=geometry)
+    other = tb.mls_interpolate(points, other_queries, features, k=4, geometry=geometry)
+# Saved tensors remain available for backward after the geometry closes.
+```
+
+Create a new geometry object each model forward. The original tensor must stay
+unchanged while the object is open. Conditional MLS accepts `true_geometry`
+and `false_geometry`; multihead MLS accepts `geometry`.
+See [prepared geometry](https://github.com/Robh96/torchbvh/blob/main/docs/api_reference.md#pointgeometry)
+for lifecycle rules and automatic dispatch eligibility.
 
 ## References
 

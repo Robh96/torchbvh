@@ -5,12 +5,25 @@ import torch
 from . import _C
 from ._constants import SUPPORTED_DIMS
 from ._handles import _batched_bvh_data, _temporary_bvh
+from ._geometry import PointGeometry, _source_bvh, _validate_geometry
 from ._mls import _linear_mls_spatial_indexed
+from ._mls_routed import _routed_mls_spatial_indexed
+from . import _mls_routed
+from . import _mls_geometry
+from ._conditional_layout import _pack_routed_queries
 from ._query import _build_bvh_batched
 from ._validation import _as_contiguous, _validate_supported_k
 
 
 _OP = "conditional_mls_interpolate"
+_PREPARED_KNN_THREADS = 0  # Experimental dispatch; promote after paired gates.
+_DIRECT_FEATURE_BANKS = False
+_BIN_RESOLUTION = 0
+_BIN_DIAGNOSTICS = None
+_ADAPTIVE_BINS = False
+_FUSED_QUERY_PACK = False
+_EXPERIMENTAL_FAST_POLICY = False
+_FAST_POLICY_SPATIAL_BITS = 6
 
 
 def _validate_inputs(
@@ -87,6 +100,8 @@ def conditional_mls_interpolate(
     false_features: torch.Tensor,
     k: int = 4,
     return_grad: bool = False,
+    true_geometry: PointGeometry | None = None,
+    false_geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Evaluate exactly one of two local-linear MLS branches per query.
 
@@ -110,9 +125,15 @@ def conditional_mls_interpolate(
         Values with shape ``(B, M, H, C)``. If ``return_grad=True``, returns
         ``(values, field_gradient)`` with gradient shape ``(B, M, H, D, C)``.
     """
-    B, M, H, D, _ = _validate_inputs(
+    B, M, H, D, C = _validate_inputs(
         mask, true_points, true_queries, true_features,
         false_points, false_queries, false_features, k,
+    )
+    _validate_geometry(true_points, true_geometry)
+    _validate_geometry(false_points, false_geometry)
+    fast_policy = (
+        D == 2 and k == 4 and C in (4, 8, 16)
+        and false_points.size(1) >= 512 and B * M * H >= 4096
     )
     mask = _as_contiguous(mask)
     true_points = _as_contiguous(true_points)
@@ -122,31 +143,68 @@ def conditional_mls_interpolate(
     true_features = _as_contiguous(true_features)
     false_features = _as_contiguous(false_features)
 
-    route_by_head = mask.permute(0, 2, 1).unsqueeze(-1)
-    selected_by_head = torch.where(
-        route_by_head,
-        true_queries.permute(0, 2, 1, 3),
-        false_queries.permute(0, 2, 1, 3),
-    ).contiguous()
+    if _FUSED_QUERY_PACK or fast_policy:
+        selected_by_head, flat_routes = _pack_routed_queries(true_queries, false_queries, mask)
+    else:
+        route_by_head = mask.permute(0, 2, 1).unsqueeze(-1)
+        selected_by_head = torch.where(
+            route_by_head,
+            true_queries.permute(0, 2, 1, 3),
+            false_queries.permute(0, 2, 1, 3),
+        ).contiguous()
+        flat_routes = mask.permute(0, 2, 1).reshape(B, H * M).contiguous()
     flat_queries = selected_by_head.detach().reshape(B, H * M, D).contiguous()
-    flat_routes = mask.permute(0, 2, 1).reshape(B, H * M).contiguous()
-    true_points_detached = true_points.detach().contiguous()
-    false_points_detached = false_points.detach().contiguous()
+    true_points_detached = true_points.detach().contiguous() if true_geometry is None else true_geometry._points
+    false_points_detached = false_points.detach().contiguous() if false_geometry is None else false_geometry._points
 
-    with _temporary_bvh(_build_bvh_batched, true_points_detached) as true_bvh:
-        with _temporary_bvh(_build_bvh_batched, false_points_detached) as false_bvh:
+    with _source_bvh(_build_bvh_batched, true_points_detached, true_geometry) as true_bvh:
+        with _source_bvh(_build_bvh_batched, false_points_detached, false_geometry) as false_bvh:
             true_data = _batched_bvh_data(true_bvh, _OP)
             false_data = _batched_bvh_data(false_bvh, _OP)
-            query_order = _C.morton_sort_routed_queries_batched(
-                flat_queries,
-                flat_routes,
-                true_data["scene_min"],
-                true_data["scene_max"],
-                false_data["scene_min"],
-                false_data["scene_max"],
-            ).contiguous()
-            indices, squared_distances = (
-                _C.query_knn_routed_batched_cached_bounds_spatial(
+            ordering_fn = _C.morton_sort_routed_queries_batched
+            ordering_args = ()
+            if fast_policy:
+                ordering_fn = _C.morton_sort_routed_queries_narrow
+                ordering_args = (_FAST_POLICY_SPATIAL_BITS,)
+            if fast_policy and _FAST_POLICY_SPATIAL_BITS == 0:
+                query_order = torch.arange(H * M, device=flat_queries.device).expand(B, -1).contiguous()
+            else:
+                query_order = ordering_fn(
+                    flat_queries,
+                    flat_routes,
+                    true_data["scene_min"],
+                    true_data["scene_max"],
+                    false_data["scene_min"],
+                    false_data["scene_max"],
+                    *ordering_args,
+                ).contiguous()
+            query_fn = _C.query_knn_routed_batched_cached_bounds_spatial
+            traversal_args = ()
+            if _PREPARED_KNN_THREADS and true_geometry is not None and false_geometry is not None:
+                query_fn = _C.query_knn_routed_explicit
+                traversal_args = tuple(data[key] for data in (true_data, false_data)
+                                       for key in ("left_child_mem", "right_child_mem", "mem_to_leaf")) + (_PREPARED_KNN_THREADS,)
+            if (_BIN_RESOLUTION or fast_policy) and D == 2 and k == 4 and false_points.size(1) >= 512:
+                resolution = _BIN_RESOLUTION
+                if fast_policy:
+                    # Target average occupancy <=4 up to the resolution cap. A fixed
+                    # 64x64 grid exhausts the exact search's 64-candidate budget
+                    # when dense queries need to visit adjacent cells.
+                    resolution = 16
+                    while resolution < 256 and false_points.size(1) > 4 * resolution * resolution:
+                        resolution *= 2
+                elif _ADAPTIVE_BINS:
+                    resolution = min(resolution, 64 if false_points.size(1) >= 8192 else
+                                     32 if false_points.size(1) >= 2048 else 16)
+                bins = false_data.setdefault("point_bins", {})
+                if resolution not in bins:
+                    bins[resolution] = _C.build_point_bins(
+                        false_points_detached, false_data["scene_min"], false_data["scene_max"], resolution)
+                query_fn = _C.query_knn_routed_bins
+                traversal_args = (false_points_detached, false_data["scene_min"], false_data["scene_max"],
+                                  *bins[resolution], resolution)
+            knn_result = (
+                query_fn(
                     true_data["node_aabbs"],
                     true_data["sorted_indices"],
                     false_data["node_aabbs"],
@@ -160,36 +218,60 @@ def conditional_mls_interpolate(
                     false_data["num_real_nodes"],
                     D,
                     k,
+                    *traversal_args,
                 )
             )
+            indices, squared_distances = knn_result[:2]
+            if len(knn_result) == 3 and _BIN_DIAGNOSTICS is not None:
+                _BIN_DIAGNOSTICS.append(knn_result[2])
 
     combined_points = torch.cat(
         (true_points_detached, false_points_detached), dim=1
     ).contiguous()
-    combined_features = torch.cat((true_features, false_features), dim=1)
     source_count = combined_points.size(1)
-    channels = combined_features.size(-1)
-    feature_bank = combined_features.permute(0, 2, 1, 3).reshape(
-        B * H, source_count, channels
-    ).contiguous()
-    result = _linear_mls_spatial_indexed(
+    channels = true_features.size(-1)
+    geometry_owner = _mls_geometry.eligible(D, k, channels, B * H * M)
+    mls_fn = _linear_mls_spatial_indexed
+    mls_kwargs = {}
+    query_major_output = False
+    if geometry_owner:
+        mls_fn = _mls_geometry.interpolate
+        feature_args = (true_features, false_features)
+        query_major_output = True
+        mls_kwargs["query_major_output"] = True
+    elif (_DIRECT_FEATURE_BANKS or fast_policy) and channels <= 32:
+        mls_fn = _routed_mls_spatial_indexed
+        feature_args = (true_features, false_features)
+        query_major_output = fast_policy or _mls_routed._QUERY_MAJOR_OUTPUT
+        if query_major_output:
+            mls_kwargs["query_major_output"] = True
+    else:
+        combined_features = torch.cat((true_features, false_features), dim=1)
+        feature_args = (combined_features.permute(0, 2, 1, 3).reshape(
+            B * H, source_count, channels).contiguous(),)
+    result = mls_fn(
         selected_by_head.reshape(B * H * M, D),
         combined_points,
         indices.reshape(B * H * M, k),
         squared_distances.reshape(B * H * M, k),
-        feature_bank,
+        *feature_args,
         query_order.reshape(B * H * M),
         queries_per_batch=H * M,
         queries_per_head=M,
         return_grad=return_grad,
+        **mls_kwargs,
     )
     if return_grad:
         values, gradient = result
+        if query_major_output:
+            return values.reshape(B, M, H, channels), gradient.reshape(B, M, H, D, channels)
         return (
             values.reshape(B, H, M, channels).permute(0, 2, 1, 3).contiguous(),
             gradient.reshape(B, H, M, D, channels)
             .permute(0, 2, 1, 3, 4).contiguous(),
         )
+    if query_major_output:
+        return result.reshape(B, M, H, channels)
     return result.reshape(B, H, M, channels).permute(0, 2, 1, 3).contiguous()
 
 

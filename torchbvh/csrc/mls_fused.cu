@@ -19,7 +19,29 @@ __device__ __forceinline__ float packed_basis_value(
     return i == 0 ? 1.0f : delta[j * D + i - 1];
 }
 
-template <int D, int K, bool Indexed = false>
+// Preserve the solve's arithmetic while accessing native (B,N,H,C) banks.
+template <bool Routed>
+__device__ __forceinline__ float mls_feature_value(
+    const float* features, const float* false_features, int64_t fb,
+    int64_t index, int source_count, int channels, int heads, int true_count, int c) {
+    if constexpr (!Routed) return features[(fb * source_count + index) * channels + c];
+    const bool route = index < true_count;
+    const int count = route ? true_count : source_count - true_count;
+    const int64_t local = route ? index : index - true_count;
+    const float* bank = route ? features : false_features;
+    return bank[((fb / heads * count + local) * heads + fb % heads) * channels + c];
+}
+
+template <bool Routed>
+__device__ __forceinline__ float* mls_feature_gradient(
+    float* gradient, int64_t src, int source_count, int channels, int heads, int c) {
+    if constexpr (!Routed) return gradient + src * channels + c;
+    const int64_t fb = src / source_count;
+    const int64_t index = src - fb * source_count;
+    return gradient + ((fb / heads * source_count + index) * heads + fb % heads) * channels + c;
+}
+
+template <int D, int K, bool Indexed = false, bool ReturnGradient = true, bool Routed = false, int ChannelTile = 1, bool SharedCoefficients = false>
 __global__ void mls_packed_forward_kernel(
     const float* __restrict__ displaced_points,
     const float* __restrict__ neighbor_positions,
@@ -41,10 +63,12 @@ __global__ void mls_packed_forward_kernel(
     int queries_per_head,
     float regularization,
     float bandwidth_min,
-    float exact_eps
+    float exact_eps,
+    const float* false_features, int true_count, float coefficient_safe_ratio, bool query_major_output = false
 ) {
     constexpr int P = D + 1;
-    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x) / ChannelTile;
+    const int channel_lane = threadIdx.x % ChannelTile;
     if (storage_qrow >= total_queries) return;
     const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
     const int qrow = Indexed
@@ -54,6 +78,10 @@ __global__ void mls_packed_forward_kernel(
         ? (int64_t)sample * (queries_per_batch / queries_per_head)
             + ((qrow - sample * queries_per_batch) / queries_per_head)
         : feature_batch[qrow];
+    const int output_qrow = Routed && query_major_output
+        ? sample * queries_per_batch + ((qrow - sample * queries_per_batch) % queries_per_head)
+            * (queries_per_batch / queries_per_head) + (qrow - sample * queries_per_batch) / queries_per_head
+        : qrow;
     if (fb < 0 || fb >= feature_batches) return;
     const float bandwidth = fmaxf(
         squared_distances[storage_qrow * K + ((K - 1) / 2)], bandwidth_min);
@@ -77,21 +105,21 @@ __global__ void mls_packed_forward_kernel(
         weights[j] = expf(-dsq / (2.0f * bandwidth));
         exact_count += squared_distances[storage_qrow * K + j] <= exact_eps;
     }
-    exact_counts[storage_qrow] = exact_count;
+    if (channel_lane == 0) exact_counts[storage_qrow] = exact_count;
 
     if (exact_count > 0) {
-        for (int c = 0; c < channels; ++c) {
+        for (int c = channel_lane; c < channels; c += ChannelTile) {
             float sum = 0.0f;
             #pragma unroll
             for (int j = 0; j < K; ++j) {
                 if (squared_distances[storage_qrow * K + j] <= exact_eps) {
-                    sum += features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+                    sum += mls_feature_value<Routed>(features, false_features, fb, indices[storage_qrow * K + j], source_count, channels, queries_per_batch / queries_per_head, true_count, c);
                 }
             }
-            interpolated[qrow * channels + c] = sum / (float)exact_count;
+            interpolated[output_qrow * channels + c] = sum / (float)exact_count;
             #pragma unroll
             for (int d = 0; d < D; ++d) {
-                field_gradient[(qrow * D + d) * channels + c] = 0.0f;
+                if constexpr (ReturnGradient) field_gradient[(output_qrow * D + d) * channels + c] = 0.0f;
             }
         }
         return;
@@ -117,8 +145,11 @@ __global__ void mls_packed_forward_kernel(
     for (int i = 0; i < P; ++i) trace += A[i * P + i];
     const float jitter = fmaxf(1.0e-5f, 1.0e-4f * trace / (float)P);
     float L[P * P];
+    bool solve_stable = false;
+    bool used_jitter = false;
     #pragma unroll
     for (int attempt = 0; attempt < 2; ++attempt) {
+        used_jitter |= attempt != 0;
         int stable = 1;
         const float diagonal_jitter = attempt == 0 ? 0.0f : jitter;
         #pragma unroll
@@ -136,29 +167,81 @@ __global__ void mls_packed_forward_kernel(
                     const float scale = fabsf(A[i * P + i] + diagonal_jitter);
                     const float floor = fmaxf(1.0e-12f, fminf(1.0e-5f, 1.0e-3f * scale));
                     if (!(s > floor)) { stable = 0; s = floor; }
-                    factors[storage_qrow * P * P + i * P + i] = s;
+                    if (channel_lane == 0) factors[storage_qrow * P * P + i * P + i] = s;
                     L[i * P + i] = sqrtf(s);
                 } else {
                     const float denom = L[j * P + j];
                     const float value = denom > 0.0f ? s / denom : 0.0f;
                     stable &= denom > 0.0f;
                     L[i * P + j] = value;
-                    factors[storage_qrow * P * P + i * P + j] = value;
+                    if (channel_lane == 0) factors[storage_qrow * P * P + i * P + j] = value;
                 }
             }
             #pragma unroll
             for (int j = 0; j < P; ++j) {
-                if (j > i) factors[storage_qrow * P * P + i * P + j] = 0.0f;
+                if (channel_lane == 0 && j > i) factors[storage_qrow * P * P + i * P + j] = 0.0f;
             }
         }
-        if (stable) break;
+        if (stable) { solve_stable = true; break; }
     }
 
-    for (int c = 0; c < channels; ++c) {
+    if constexpr (SharedCoefficients && !ReturnGradient) {
+        float smallest = 3.4028234663852886e38F, largest = 0;
+        #pragma unroll
+        for (int i = 0; i < P; ++i) {
+            smallest = fminf(smallest, L[i*P+i]);
+            largest = fmaxf(largest, L[i*P+i]);
+        }
+        // Negative ratios are an experimental bound on (A^-1)[0,0]:
+        // value evaluation can be well conditioned even if slope axes are not.
+        // Jitter rejection and a minimum pivot floor still apply.
+        const bool leverage_guard = coefficient_safe_ratio < 0;
+        const float pivot_floor = leverage_guard ? 1.0e-4f : coefficient_safe_ratio;
+        if (solve_stable && (coefficient_safe_ratio == 0 || !used_jitter)
+            && smallest > pivot_floor * largest) {
+            float y[P], G[P], coefficients[K];
+            #pragma unroll
+            for (int i = 0; i < P; ++i) {
+                float sum = i == 0 ? 1.0f : 0.0f;
+                #pragma unroll
+                for (int j = 0; j < P; ++j) if (j < i) sum -= L[i*P+j] * y[j];
+                y[i] = sum / fmaxf(L[i*P+i], 1.0e-20f);
+            }
+            #pragma unroll
+            for (int ii = 0; ii < P; ++ii) {
+                const int i = P-1-ii;
+                float sum = y[i];
+                #pragma unroll
+                for (int j = 0; j < P; ++j) if (j > i) sum -= L[j*P+i] * G[j];
+                G[i] = sum / fmaxf(L[i*P+i], 1.0e-20f);
+            }
+            if (!leverage_guard || (isfinite(G[0]) && G[0] > 0 && G[0] <= -coefficient_safe_ratio)) {
+            #pragma unroll
+            for (int j = 0; j < K; ++j) {
+                float sum = 0;
+                #pragma unroll
+                for (int i = 0; i < P; ++i) sum += weights[j] * packed_basis_value<D>(delta,j,i) * G[i];
+                coefficients[j] = sum;
+            }
+            for (int c = channel_lane; c < channels; c += ChannelTile) {
+                float sum = 0;
+                #pragma unroll
+                for (int j = 0; j < K; ++j)
+                    sum += coefficients[j] * mls_feature_value<Routed>(features,false_features,fb,indices[storage_qrow*K+j],source_count,channels,queries_per_batch/queries_per_head,true_count,c);
+                interpolated[output_qrow*channels+c] = sum;
+            }
+            return;
+            }
+        }
+        // Negative counts mark the unchanged solve fallback for diagnostics.
+        if (channel_lane == 0) exact_counts[storage_qrow] = -1;
+    }
+
+    for (int c = channel_lane; c < channels; c += ChannelTile) {
         float rhs[P] = {};
         #pragma unroll
         for (int j = 0; j < K; ++j) {
-            const float f = features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+            const float f = mls_feature_value<Routed>(features, false_features, fb, indices[storage_qrow * K + j], source_count, channels, queries_per_batch / queries_per_head, true_count, c);
             #pragma unroll
             for (int i = 0; i < P; ++i) {
                 rhs[i] += weights[j] * packed_basis_value<D>(delta, j, i) * f;
@@ -180,15 +263,36 @@ __global__ void mls_packed_forward_kernel(
             for (int j = 0; j < P; ++j) if (j > i) s -= L[j * P + i] * x[j];
             x[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
         }
-        interpolated[qrow * channels + c] = x[0];
+        interpolated[output_qrow * channels + c] = x[0];
         #pragma unroll
         for (int d = 0; d < D; ++d) {
-            field_gradient[(qrow * D + d) * channels + c] = x[d + 1];
+            if constexpr (ReturnGradient) field_gradient[(output_qrow * D + d) * channels + c] = x[d + 1];
         }
     }
 }
 
-template <int D, int K, bool Indexed = false>
+template <bool Aggregate>
+__device__ __forceinline__ void mls_scatter_add(float* address, float value) {
+#if __CUDA_ARCH__ >= 700
+    if constexpr (Aggregate) {
+        const unsigned active = __activemask();
+        const unsigned peers = __match_any_sync(active, (unsigned long long)address);
+        const int leader = __ffs(peers) - 1;
+        float sum = 0.f;
+        unsigned remaining = peers;
+        while (remaining) {
+            const int lane = __ffs(remaining) - 1;
+            sum += __shfl_sync(peers, value, lane);
+            remaining &= remaining - 1;
+        }
+        if ((threadIdx.x & 31) != leader) return;
+        value = sum;
+    }
+#endif
+    atomicAdd(address, value);
+}
+
+template <int D, int K, bool Indexed = false, bool Routed = false, int ChannelTile = 1, bool AggregateScatter = false, bool NeedQuery = true, bool NeedFeatures = true>
 __global__ void mls_packed_backward_kernel(
     const float* __restrict__ displaced_points,
     const float* __restrict__ neighbor_positions,
@@ -211,10 +315,12 @@ __global__ void mls_packed_backward_kernel(
     int queries_per_batch,
     int queries_per_head,
     float bandwidth_min,
-    float exact_eps
+    float exact_eps,
+    const float* false_features, int true_count, bool query_major_output = false
 ) {
     constexpr int P = D + 1;
-    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int storage_qrow = (int)(blockIdx.x * blockDim.x + threadIdx.x) / ChannelTile;
+    const int channel_lane = threadIdx.x % ChannelTile;
     if (storage_qrow >= total_queries) return;
     const int sample = Indexed ? storage_qrow / queries_per_batch : 0;
     const int qrow = Indexed
@@ -224,24 +330,28 @@ __global__ void mls_packed_backward_kernel(
         ? (int64_t)sample * (queries_per_batch / queries_per_head)
             + ((qrow - sample * queries_per_batch) / queries_per_head)
         : feature_batch[qrow];
+    const int output_qrow = Routed && query_major_output
+        ? sample * queries_per_batch + ((qrow - sample * queries_per_batch) % queries_per_head)
+            * (queries_per_batch / queries_per_head) + (qrow - sample * queries_per_batch) / queries_per_head
+        : qrow;
     if (fb < 0 || fb >= feature_batches) {
         #pragma unroll
-        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        for (int d = 0; d < D; ++d) if constexpr (NeedQuery) if (channel_lane == 0) d_displaced_points[qrow * D + d] = 0.0f;
         return;
     }
     const int exact_count = exact_counts[storage_qrow];
     if (exact_count > 0) {
-        for (int c = 0; c < channels; ++c) {
-            const float scale = d_interpolated[qrow * channels + c] / (float)exact_count;
+        for (int c = channel_lane; c < channels; c += ChannelTile) {
+            const float scale = d_interpolated[output_qrow * channels + c] / (float)exact_count;
             #pragma unroll
             for (int j = 0; j < K; ++j) {
                 if (squared_distances[storage_qrow * K + j] <= exact_eps) {
-                    atomicAdd(&d_features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c], scale);
+                    if constexpr (NeedFeatures) atomicAdd(mls_feature_gradient<Routed>(d_features, fb * source_count + indices[storage_qrow * K + j], source_count, channels, queries_per_batch / queries_per_head, c), scale);
                 }
             }
         }
         #pragma unroll
-        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        for (int d = 0; d < D; ++d) if constexpr (NeedQuery) if (channel_lane == 0) d_displaced_points[qrow * D + d] = 0.0f;
         return;
     }
 
@@ -261,7 +371,7 @@ __global__ void mls_packed_backward_kernel(
     }
     if (ill_conditioned) {
         #pragma unroll
-        for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = 0.0f;
+        for (int d = 0; d < D; ++d) if constexpr (NeedQuery) if (channel_lane == 0) d_displaced_points[qrow * D + d] = 0.0f;
         return;
     }
 
@@ -286,13 +396,13 @@ __global__ void mls_packed_backward_kernel(
     }
 
     float dq[D] = {};
-    for (int c = 0; c < channels; ++c) {
+    for (int c = channel_lane; c < channels; c += ChannelTile) {
         float dx[P];
-        dx[0] = d_interpolated[qrow * channels + c];
+        dx[0] = d_interpolated[output_qrow * channels + c];
         #pragma unroll
         for (int d = 0; d < D; ++d) {
             dx[d + 1] = d_field_gradient == nullptr
-                ? 0.0f : d_field_gradient[(qrow * D + d) * channels + c];
+                ? 0.0f : d_field_gradient[(output_qrow * D + d) * channels + c];
         }
         float yg[P], G[P];
         #pragma unroll
@@ -311,14 +421,16 @@ __global__ void mls_packed_backward_kernel(
             G[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
         }
 
+        float x[P] = {};
+        if constexpr (NeedQuery) {
         float rhs[P] = {};
         #pragma unroll
         for (int j = 0; j < K; ++j) {
-            const float f = features[(fb * source_count + indices[storage_qrow * K + j]) * channels + c];
+            const float f = mls_feature_value<Routed>(features, false_features, fb, indices[storage_qrow * K + j], source_count, channels, queries_per_batch / queries_per_head, true_count, c);
             #pragma unroll
             for (int i = 0; i < P; ++i) rhs[i] += weights[j] * packed_basis_value<D>(delta, j, i) * f;
         }
-        float yx[P], x[P];
+        float yx[P];
         #pragma unroll
         for (int i = 0; i < P; ++i) {
             float s = rhs[i];
@@ -335,29 +447,55 @@ __global__ void mls_packed_backward_kernel(
             x[i] = s / fmaxf(L[i * P + i], 1.0e-20f);
         }
 
+        }
+
+        float channel_terms[K * D];
         #pragma unroll
         for (int j = 0; j < K; ++j) {
             const int64_t src = fb * source_count + indices[storage_qrow * K + j];
-            const float f = features[src * channels + c];
+            float f = 0.f;
+            if constexpr (NeedQuery) f = mls_feature_value<Routed>(features, false_features, fb, src - fb * source_count, source_count, channels, queries_per_batch / queries_per_head, true_count, c);
             float df = 0.0f, ay = 0.0f, fitted = 0.0f;
             #pragma unroll
             for (int i = 0; i < P; ++i) {
                 const float phi = packed_basis_value<D>(delta, j, i);
-                df += weights[j] * phi * G[i];
-                ay += phi * G[i];
-                fitted += phi * x[i];
+                if constexpr (NeedFeatures) df += weights[j] * phi * G[i];
+                if constexpr (NeedQuery) ay += phi * G[i];
+                if constexpr (NeedQuery) fitted += phi * x[i];
             }
-            atomicAdd(&d_features[src * channels + c], df);
+            if constexpr (NeedFeatures) mls_scatter_add<AggregateScatter>(mls_feature_gradient<Routed>(d_features, src, source_count, channels, queries_per_batch / queries_per_head, c), df);
+            if constexpr (NeedQuery) {
             const float residual = f - fitted;
             #pragma unroll
             for (int d = 0; d < D; ++d) {
-                dq[d] += weights[j] * (residual * G[d + 1] - ay * x[d + 1])
+                const float term = weights[j] * (residual * G[d + 1] - ay * x[d + 1])
                     - ay * residual * weights[j] * delta[j * D + d] / bandwidth;
+                if constexpr (ChannelTile == 1) dq[d] += term;
+                else channel_terms[j * D + d] = term;
+            }
+            }
+        }
+        if constexpr (ChannelTile > 1 && NeedQuery) {
+            const unsigned active = __activemask();
+            // Accumulate in the original channel/neighbor order, including
+            // each intermediate float32 rounding, rather than a tree sum.
+            #pragma unroll
+            for (int lane = 0; lane < ChannelTile; ++lane) {
+                #pragma unroll
+                for (int j = 0; j < K; ++j) {
+                    #pragma unroll
+                    for (int d = 0; d < D; ++d) {
+                        const float term = __shfl_sync(active, channel_terms[j * D + d], lane, ChannelTile);
+                        if (channel_lane == 0) dq[d] += term;
+                    }
+                }
             }
         }
     }
     #pragma unroll
-    for (int d = 0; d < D; ++d) d_displaced_points[qrow * D + d] = dq[d];
+    for (int d = 0; d < D; ++d) {
+        if constexpr (NeedQuery) if (channel_lane == 0) d_displaced_points[qrow * D + d] = dq[d];
+    }
 }
 
 // Cooperative fused MLS forward kernel.
@@ -374,7 +512,7 @@ __global__ void mls_packed_backward_kernel(
 // A is symmetric positive definite; Cholesky is unconditionally stable with λ > 0.
 // Factors output stores L (lower-triangular) for Python diagonal-check fallback.
 
-template <int D, int K, bool Indexed = false>
+template <int D, int K, bool Indexed = false, bool ReturnGradient = true>
 __global__ void mls_fused_forward_kernel(
     const float* __restrict__ displaced_points,   // (M, D)
     const float* __restrict__ neighbor_positions, // (M, K, D)
@@ -553,7 +691,7 @@ __global__ void mls_fused_forward_kernel(
             interpolated[qrow * channels + c] = sum / (float)exact_sh;
             #pragma unroll
             for (int d = 0; d < D; ++d)
-                field_gradient[(qrow * D + d) * channels + c] = 0.0f;
+                if constexpr (ReturnGradient) field_gradient[(qrow * D + d) * channels + c] = 0.0f;
         }
         return;
     }
@@ -596,7 +734,7 @@ __global__ void mls_fused_forward_kernel(
         interpolated[qrow * channels + c] = x[0];
         #pragma unroll
         for (int d = 0; d < D; ++d)
-            field_gradient[(qrow * D + d) * channels + c] = x[1 + d];
+            if constexpr (ReturnGradient) field_gradient[(qrow * D + d) * channels + c] = x[1 + d];
     }
 }
 
@@ -882,7 +1020,7 @@ __global__ void mls_fused_backward_kernel(
     }
 }
 
-template <int D, int K>
+template <int D, int K, bool ReturnGradient = true, bool Routed = false, int ChannelTile = 1, bool SharedCoefficients = false>
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 launch_mls_packed_indexed_forward(
     torch::Tensor displaced_points,
@@ -895,33 +1033,39 @@ launch_mls_packed_indexed_forward(
     int queries_per_head,
     float regularization,
     float bandwidth_min,
-    float exact_eps
+    float exact_eps,
+    torch::Tensor false_features = torch::Tensor(),
+    float coefficient_safe_ratio = 0.05f,
+    bool query_major_output = false
 ) {
     constexpr int P = D + 1;
     const int total_queries = static_cast<int>(displaced_points.size(0));
-    const int channels = static_cast<int>(features.size(2));
+    const int channels = static_cast<int>(features.size(Routed ? 3 : 2));
     auto interpolated = torch::empty({total_queries, channels}, features.options());
-    auto field_gradient = torch::empty({total_queries, D, channels}, features.options());
+    auto field_gradient = ReturnGradient
+        ? torch::empty({total_queries, D, channels}, features.options())
+        : torch::empty({0}, features.options());
     auto factors = torch::empty({total_queries, P, P}, features.options());
     auto exact_counts = torch::empty({total_queries}, indices.options().dtype(torch::kInt32));
     constexpr int threads = 128;
-    const int blocks = (total_queries + threads - 1) / threads;
-    mls_packed_forward_kernel<D, K, true><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const int blocks = (total_queries * ChannelTile + threads - 1) / threads;
+    mls_packed_forward_kernel<D, K, true, ReturnGradient, Routed, ChannelTile, SharedCoefficients><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         displaced_points.data_ptr<float>(), nullptr,
         indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
         features.data_ptr<float>(), nullptr,
         source_points.data_ptr<float>(), query_order.data_ptr<int64_t>(),
         interpolated.data_ptr<float>(), field_gradient.data_ptr<float>(),
         factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
-        total_queries, static_cast<int>(features.size(0)),
-        static_cast<int>(features.size(1)), channels,
+        total_queries, static_cast<int>(Routed ? features.size(0) * features.size(2) : features.size(0)),
+        static_cast<int>(source_points.size(1)), channels,
         queries_per_batch, queries_per_head,
-        regularization, bandwidth_min, exact_eps);
+        regularization, bandwidth_min, exact_eps,
+        Routed ? false_features.data_ptr<float>() : nullptr, Routed ? static_cast<int>(features.size(1)) : 0, coefficient_safe_ratio, query_major_output);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {interpolated, field_gradient, factors, exact_counts};
 }
 
-template <int D, int K>
+template <int D, int K, bool Routed = false, int ChannelTile = 1, bool AggregateScatter = false, bool NeedQuery = true, bool NeedFeatures = true>
 static std::tuple<torch::Tensor, torch::Tensor>
 launch_mls_packed_indexed_backward(
     torch::Tensor displaced_points,
@@ -937,17 +1081,21 @@ launch_mls_packed_indexed_backward(
     int queries_per_batch,
     int queries_per_head,
     float bandwidth_min,
-    float exact_eps
+    float exact_eps,
+    torch::Tensor false_features = torch::Tensor(),
+    bool query_major_output = false
 ) {
     const int total_queries = static_cast<int>(displaced_points.size(0));
-    const int channels = static_cast<int>(features.size(2));
-    auto d_features = torch::zeros_like(features);
-    auto d_displaced = torch::empty_like(displaced_points);
+    const int channels = static_cast<int>(features.size(Routed ? 3 : 2));
+    auto d_features = !NeedFeatures ? torch::empty({0}, features.options()) : Routed
+        ? torch::zeros({features.size(0), source_points.size(1), features.size(2), features.size(3)}, features.options())
+        : torch::zeros_like(features);
+    auto d_displaced = NeedQuery ? torch::empty_like(displaced_points) : torch::empty({0}, displaced_points.options());
     const float* d_field_ptr = d_field_gradient.numel() > 0
         ? d_field_gradient.data_ptr<float>() : nullptr;
     constexpr int threads = 128;
-    const int blocks = (total_queries + threads - 1) / threads;
-    mls_packed_backward_kernel<D, K, true><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    const int blocks = (total_queries * ChannelTile + threads - 1) / threads;
+    mls_packed_backward_kernel<D, K, true, Routed, ChannelTile, AggregateScatter, NeedQuery, NeedFeatures><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         displaced_points.data_ptr<float>(), nullptr,
         indices.data_ptr<int64_t>(), squared_distances.data_ptr<float>(),
         features.data_ptr<float>(), nullptr,
@@ -955,9 +1103,10 @@ launch_mls_packed_indexed_backward(
         factors.data_ptr<float>(), exact_counts.data_ptr<int32_t>(),
         d_interpolated.data_ptr<float>(), d_field_ptr,
         d_features.data_ptr<float>(), d_displaced.data_ptr<float>(),
-        total_queries, static_cast<int>(features.size(0)),
-        static_cast<int>(features.size(1)), channels,
-        queries_per_batch, queries_per_head, bandwidth_min, exact_eps);
+        total_queries, static_cast<int>(Routed ? features.size(0) * features.size(2) : features.size(0)),
+        static_cast<int>(source_points.size(1)), channels,
+        queries_per_batch, queries_per_head, bandwidth_min, exact_eps,
+        Routed ? false_features.data_ptr<float>() : nullptr, Routed ? static_cast<int>(features.size(1)) : 0, query_major_output);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {d_features, d_displaced};
 }
@@ -965,7 +1114,7 @@ launch_mls_packed_indexed_backward(
 // Wide-channel indexed specialization. It retains Morton-ordered storage and
 // in-kernel source-position loads, while assigning one cooperative block to a
 // query so feature channels are processed in parallel.
-template <int D, int K>
+template <int D, int K, bool ReturnGradient = true>
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 launch_mls_cooperative_indexed_forward(
     torch::Tensor displaced_points,
@@ -984,12 +1133,14 @@ launch_mls_cooperative_indexed_forward(
     const int total_queries = static_cast<int>(displaced_points.size(0));
     const int channels = static_cast<int>(features.size(2));
     auto interpolated = torch::empty({total_queries, channels}, features.options());
-    auto field_gradient = torch::empty({total_queries, D, channels}, features.options());
+    auto field_gradient = ReturnGradient
+        ? torch::empty({total_queries, D, channels}, features.options())
+        : torch::empty({0}, features.options());
     auto factors = torch::empty({total_queries, P, P}, features.options());
     auto exact_counts = torch::empty(
         {total_queries}, indices.options().dtype(torch::kInt32));
     constexpr int threads = 128;
-    mls_fused_forward_kernel<D, K, true><<<
+    mls_fused_forward_kernel<D, K, true, ReturnGradient><<<
         static_cast<unsigned int>(total_queries), threads, 0,
         at::cuda::getCurrentCUDAStream()
     >>>(
@@ -1062,7 +1213,8 @@ mls_packed_indexed_forward_cuda(
     int queries_per_head,
     double regularization,
     double bandwidth_min,
-    double exact_eps
+    double exact_eps,
+    bool return_grad
 ) {
     const char* op = "mls_packed_indexed_forward";
     TORCH_CHECK(displaced_points.is_cuda() && source_points.is_cuda()
@@ -1083,8 +1235,8 @@ mls_packed_indexed_forward_cuda(
 #define DISPATCH_INDEXED_FWD(D, K) \
     do { \
         if (features.size(2) <= 32) \
-            return launch_mls_packed_indexed_forward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
-        return launch_mls_cooperative_indexed_forward<D, K>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
+            return return_grad ? launch_mls_packed_indexed_forward<D, K, true>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps) : launch_mls_packed_indexed_forward<D, K, false>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
+        return return_grad ? launch_mls_cooperative_indexed_forward<D, K, true>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps) : launch_mls_cooperative_indexed_forward<D, K, false>(displaced_points, source_points, indices, squared_distances, features, query_order, queries_per_batch, queries_per_head, (float)regularization, (float)bandwidth_min, (float)exact_eps); \
     } while (false)
     if (dim == 2 && k == 4) DISPATCH_INDEXED_FWD(2, 4);
     if (dim == 2 && k == 8) DISPATCH_INDEXED_FWD(2, 8);
@@ -1095,6 +1247,7 @@ mls_packed_indexed_forward_cuda(
     DISPATCH_INDEXED_FWD(3, 16);
 #undef DISPATCH_INDEXED_FWD
 }
+
 
 std::tuple<torch::Tensor, torch::Tensor> mls_packed_indexed_backward_cuda(
     torch::Tensor displaced_points,
@@ -1133,4 +1286,84 @@ std::tuple<torch::Tensor, torch::Tensor> mls_packed_indexed_backward_cuda(
     TORCH_CHECK(dim == 3 && k == 16, op, ": D must be 2/3 and K must be 4/8/16");
     DISPATCH_INDEXED_BWD(3, 16);
 #undef DISPATCH_INDEXED_BWD
+}
+
+static void validate_routed_mls(
+    torch::Tensor queries, torch::Tensor sources, torch::Tensor indices,
+    torch::Tensor distances, torch::Tensor features, torch::Tensor false_features,
+    torch::Tensor order, int per_batch, int per_head) {
+    const char* op = "mls_routed_indexed";
+    for (const auto& t : {queries, sources, distances, features, false_features})
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == torch::kFloat32 &&
+                    t.device() == queries.device(), op, ": same-device contiguous CUDA float32 required");
+    for (const auto& t : {indices, order})
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == torch::kInt64 &&
+                    t.device() == queries.device(), op, ": same-device contiguous CUDA int64 required");
+    TORCH_CHECK(per_batch > 0 && per_head > 0 && per_batch % per_head == 0,
+                op, ": invalid query layout");
+    TORCH_CHECK(features.dim() == 4 && false_features.dim() == 4 && sources.dim() == 3 &&
+                queries.dim() == 2 && indices.dim() == 2 && order.dim() == 1,
+                op, ": invalid input rank");
+    const int64_t batch = sources.size(0), heads = per_batch / per_head;
+    TORCH_CHECK(features.size(0) == batch && false_features.size(0) == batch &&
+                features.size(2) == heads && false_features.size(2) == heads &&
+                features.size(3) == false_features.size(3) && features.size(3) > 0 && features.size(3) <= 32 &&
+                features.size(1) + false_features.size(1) == sources.size(1) &&
+                queries.size(0) == batch * per_batch && queries.size(1) == sources.size(2) &&
+                indices.size(0) == queries.size(0) && distances.sizes() == indices.sizes() &&
+                order.numel() == queries.size(0), op, ": incompatible input shapes");
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mls_routed_indexed_forward_cuda(
+    torch::Tensor queries, torch::Tensor sources, torch::Tensor indices,
+    torch::Tensor distances, torch::Tensor features, torch::Tensor false_features,
+    torch::Tensor order, int per_batch, int per_head,
+    double regularization, double bandwidth_min, double exact_eps, bool return_grad, int channel_tile, bool shared_coefficients, double safe_ratio, bool query_major_output) {
+    validate_routed_mls(queries, sources, indices, distances, features, false_features, order, per_batch, per_head);
+    TORCH_CHECK(channel_tile == 1 || channel_tile == 4 || channel_tile == 8 || channel_tile == 16, "mls_routed_indexed: invalid channel tile");
+    c10::cuda::CUDAGuard guard(queries.device());
+    const int dim = queries.size(1), k = indices.size(1);
+    if (features.size(3) % channel_tile != 0) channel_tile = 1;
+#define ROUTED_FORWARD(D,K) do { if (channel_tile == 1) { return shared_coefficients ? (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,1,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,1,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)) : (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,1>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,1>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)); } if (channel_tile == 4) { return shared_coefficients ? (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,4,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,4,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)) : (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,4>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,4>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)); } if (channel_tile == 8) { return shared_coefficients ? (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,8,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,8,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)) : (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,8>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,8>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)); } if (channel_tile == 16) { return shared_coefficients ? (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,16,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,16,true>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)) : (return_grad ? launch_mls_packed_indexed_forward<D,K,true,true,16>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output) : launch_mls_packed_indexed_forward<D,K,false,true,16>(queries,sources,indices,distances,features,order,per_batch,per_head,(float)regularization,(float)bandwidth_min,(float)exact_eps,false_features,(float)safe_ratio,query_major_output)); } } while(false)
+    if (dim == 2 && k == 4) { ROUTED_FORWARD(2,4); }
+    if (dim == 2 && k == 8) { ROUTED_FORWARD(2,8); }
+    if (dim == 2 && k == 16) { ROUTED_FORWARD(2,16); }
+    if (dim == 3 && k == 4) { ROUTED_FORWARD(3,4); }
+    if (dim == 3 && k == 8) { ROUTED_FORWARD(3,8); }
+    TORCH_CHECK(dim == 3 && k == 16, "mls_routed_indexed: D must be 2/3 and k must be 4/8/16");
+    ROUTED_FORWARD(3,16);
+#undef ROUTED_FORWARD
+    TORCH_CHECK(false, "mls_routed_indexed: invalid dispatch");
+}
+
+std::tuple<torch::Tensor, torch::Tensor> mls_routed_indexed_backward_cuda(
+    torch::Tensor queries, torch::Tensor sources, torch::Tensor indices,
+    torch::Tensor distances, torch::Tensor features, torch::Tensor false_features,
+    torch::Tensor order, torch::Tensor factors, torch::Tensor exact_counts,
+    torch::Tensor d_values, torch::Tensor d_slopes, int per_batch, int per_head,
+    double bandwidth_min, double exact_eps, int channel_tile, bool query_major_output, bool aggregate_scatter, bool need_query, bool need_features) {
+    validate_routed_mls(queries, sources, indices, distances, features, false_features, order, per_batch, per_head);
+    TORCH_CHECK(channel_tile == 1 || channel_tile == 4 || channel_tile == 8 || channel_tile == 16, "mls_routed_indexed: invalid channel tile");
+    c10::cuda::CUDAGuard guard(queries.device());
+    const int dim = queries.size(1), k = indices.size(1);
+    if (features.size(3) % channel_tile != 0) channel_tile = 1;
+    if (dim == 2 && k == 4 && channel_tile == 1) {
+        if (!need_query && need_features)
+            return launch_mls_packed_indexed_backward<2,4,true,1,false,false,true>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output);
+        if (need_query && !need_features)
+            return launch_mls_packed_indexed_backward<2,4,true,1,false,true,false>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output);
+    }
+    if (aggregate_scatter && dim == 2 && k == 4 && channel_tile == 1)
+        return launch_mls_packed_indexed_backward<2,4,true,1,true>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output);
+#define ROUTED_BACKWARD(D,K) do { if (channel_tile == 1) { return launch_mls_packed_indexed_backward<D,K,true,1>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output); } if (channel_tile == 4) { return launch_mls_packed_indexed_backward<D,K,true,4>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output); } if (channel_tile == 8) { return launch_mls_packed_indexed_backward<D,K,true,8>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output); } if (channel_tile == 16) { return launch_mls_packed_indexed_backward<D,K,true,16>(queries,sources,indices,distances,features,order,factors,exact_counts,d_values,d_slopes,per_batch,per_head,(float)bandwidth_min,(float)exact_eps,false_features,query_major_output); } } while(false)
+    if (dim == 2 && k == 4) { ROUTED_BACKWARD(2,4); }
+    if (dim == 2 && k == 8) { ROUTED_BACKWARD(2,8); }
+    if (dim == 2 && k == 16) { ROUTED_BACKWARD(2,16); }
+    if (dim == 3 && k == 4) { ROUTED_BACKWARD(3,4); }
+    if (dim == 3 && k == 8) { ROUTED_BACKWARD(3,8); }
+    TORCH_CHECK(dim == 3 && k == 16, "mls_routed_indexed: D must be 2/3 and k must be 4/8/16");
+    ROUTED_BACKWARD(3,16);
+#undef ROUTED_BACKWARD
+    TORCH_CHECK(false, "mls_routed_indexed: invalid dispatch");
 }

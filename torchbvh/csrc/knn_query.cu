@@ -537,3 +537,248 @@ query_knn_routed_batched_cached_bounds_spatial_cuda(
     DISPATCH_ROUTED_CACHED(3, 16);
 #undef DISPATCH_ROUTED_CACHED
 }
+
+// Experimental explicit traversal: uses metadata already owned by the BVH.
+template <int D, int K>
+__global__ void query_knn_routed_explicit_kernel(
+    const float* __restrict__ true_node_aabbs,
+    const int64_t* __restrict__ true_sorted_indices,
+    const float* __restrict__ false_node_aabbs,
+    const int64_t* __restrict__ false_sorted_indices,
+    const float* __restrict__ query_points,
+    const bool* __restrict__ routes,
+    const int64_t* __restrict__ query_order,
+    int64_t* __restrict__ out_indices,
+    float* __restrict__ out_distances,
+    int B,
+    int M,
+    int true_num_leaves,
+    int true_num_real_nodes,
+    int false_num_leaves,
+    int false_num_real_nodes,
+    const int* true_left, const int* true_right, const int* true_leaf,
+    const int* false_left, const int* false_right, const int* false_leaf
+) {
+    const int launch_query_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_queries = B * M;
+    if (launch_query_idx >= total_queries) return;
+
+    const int b = launch_query_idx / M;
+    const int storage_m = launch_query_idx - b * M;
+    const int query_idx = static_cast<int>(
+        query_order[static_cast<int64_t>(b) * M + storage_m]);
+    const int64_t flat_query_idx = static_cast<int64_t>(b) * M + query_idx;
+    const bool route = routes[flat_query_idx];
+    const int num_leaves = route ? true_num_leaves : false_num_leaves;
+    const int num_real_nodes = route ? true_num_real_nodes : false_num_real_nodes;
+    const float* all_aabbs = route ? true_node_aabbs : false_node_aabbs;
+    const int64_t* all_sorted = route ? true_sorted_indices : false_sorted_indices;
+    const float* sample_aabbs =
+        all_aabbs + static_cast<int64_t>(b) * num_real_nodes * 2 * D;
+    const int64_t* sample_sorted =
+        all_sorted + static_cast<int64_t>(b) * num_leaves;
+    const int64_t index_offset = route ? 0 : static_cast<int64_t>(true_num_leaves);
+
+    float q[D];
+    #pragma unroll
+    for (int d = 0; d < D; ++d) q[d] = query_points[flat_query_idx * D + d];
+
+    int64_t best_indices[K];
+    float best_distances[K];
+    #pragma unroll
+    for (int i = 0; i < K; ++i) {
+        best_indices[i] = -1;
+        best_distances[i] = kFloatInf;
+    }
+
+    constexpr int stack_capacity = 32;
+    unsigned long long stack[stack_capacity];
+    int stack_size = 0;
+    namespace tree = implicit_bvh::tree;
+    const int* left_children = route ? true_left : false_left;
+    const int* right_children = route ? true_right : false_right;
+    const int* leaf_ranks = route ? true_leaf : false_leaf;
+    int node_idx = 0;
+    float node_dist = min_distance_sq_to_aabb<D>(q, sample_aabbs);
+
+    while (true) {
+        if (node_dist <= best_distances[K - 1]) {
+            if (leaf_ranks[node_idx] >= 0) {
+                insert_candidate<K>(
+                    sample_sorted[leaf_ranks[node_idx]] + index_offset,
+                    node_dist, best_indices, best_distances);
+            } else {
+                const int left_idx = left_children[node_idx];
+                const int right_idx = right_children[node_idx];
+                const bool left_real = left_idx >= 0;
+                const bool right_real = right_idx >= 0;
+                const int left_mem = left_real ? left_idx : -1;
+                const int right_mem = right_real ? right_idx : -1;
+                const float left_dist = left_real
+                    ? min_distance_sq_to_aabb<D>(q, sample_aabbs + static_cast<int64_t>(left_mem) * 2 * D)
+                    : kFloatInf;
+                const float right_dist = right_real
+                    ? min_distance_sq_to_aabb<D>(q, sample_aabbs + static_cast<int64_t>(right_mem) * 2 * D)
+                    : kFloatInf;
+                const bool left_near = left_dist <= right_dist;
+                const int near_idx = left_near ? left_idx : right_idx;
+                const int far_idx = left_near ? right_idx : left_idx;
+                const float near_dist = left_near ? left_dist : right_dist;
+                const float far_dist = left_near ? right_dist : left_dist;
+                const bool near_real = left_near ? left_real : right_real;
+                const bool far_real = left_near ? right_real : left_real;
+                const float cutoff = best_distances[K - 1];
+                if (far_real && far_dist <= cutoff) {
+                    stack[stack_size++] = pack_cached_stack_entry(far_idx, far_dist);
+                }
+                if (near_real && near_dist <= cutoff) {
+                    node_idx = near_idx;
+                    node_dist = near_dist;
+                    continue;
+                }
+            }
+        }
+        if (stack_size == 0) break;
+        const unsigned long long entry = stack[--stack_size];
+        node_idx = static_cast<int>(entry >> 32);
+        node_dist = __uint_as_float(static_cast<unsigned int>(entry));
+    }
+
+    const int64_t out_offset = static_cast<int64_t>(launch_query_idx) * K;
+    #pragma unroll
+    for (int i = 0; i < K; ++i) {
+        out_indices[out_offset + i] = best_indices[i];
+        out_distances[out_offset + i] = best_distances[i];
+    }
+}
+
+template <int D, int K>
+std::tuple<torch::Tensor, torch::Tensor>
+launch_query_knn_routed_explicit(
+    torch::Tensor true_node_aabbs,
+    torch::Tensor true_sorted_indices,
+    torch::Tensor false_node_aabbs,
+    torch::Tensor false_sorted_indices,
+    torch::Tensor query_points,
+    torch::Tensor routes,
+    torch::Tensor query_order,
+    int true_num_leaves,
+    int true_num_real_nodes,
+    int false_num_leaves,
+    int false_num_real_nodes,
+    torch::Tensor true_left, torch::Tensor true_right, torch::Tensor true_leaf,
+    torch::Tensor false_left, torch::Tensor false_right, torch::Tensor false_leaf,
+    int threads
+) {
+    const int64_t B = query_points.size(0);
+    const int64_t M = query_points.size(1);
+    auto indices = torch::empty({B, M, K}, true_sorted_indices.options());
+    auto distances = torch::empty({B, M, K}, query_points.options());
+    const int blocks = static_cast<int>((B * M + threads - 1) / threads);
+    query_knn_routed_explicit_kernel<D, K>
+        <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            true_node_aabbs.data_ptr<float>(), true_sorted_indices.data_ptr<int64_t>(),
+            false_node_aabbs.data_ptr<float>(), false_sorted_indices.data_ptr<int64_t>(),
+            query_points.data_ptr<float>(), routes.data_ptr<bool>(),
+            query_order.data_ptr<int64_t>(), indices.data_ptr<int64_t>(),
+            distances.data_ptr<float>(), static_cast<int>(B), static_cast<int>(M),
+            true_num_leaves, true_num_real_nodes,
+            false_num_leaves, false_num_real_nodes,
+            true_left.data_ptr<int>(), true_right.data_ptr<int>(), true_leaf.data_ptr<int>(),
+            false_left.data_ptr<int>(), false_right.data_ptr<int>(), false_leaf.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return std::make_tuple(indices, distances);
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+query_knn_routed_explicit_cuda(
+    torch::Tensor true_node_aabbs,
+    torch::Tensor true_sorted_indices,
+    torch::Tensor false_node_aabbs,
+    torch::Tensor false_sorted_indices,
+    torch::Tensor query_points,
+    torch::Tensor routes,
+    torch::Tensor query_order,
+    int true_num_leaves,
+    int true_num_real_nodes,
+    int false_num_leaves,
+    int false_num_real_nodes,
+    int dim,
+    int k,
+    torch::Tensor true_left, torch::Tensor true_right, torch::Tensor true_leaf,
+    torch::Tensor false_left, torch::Tensor false_right, torch::Tensor false_leaf,
+    int threads
+) {
+    const char* op = "query_knn_routed_batched_cached_bounds_spatial";
+    TORCH_CHECK(dim == 2 || dim == 3, op, ": D must be 2 or 3");
+    for (const auto& tensor : {true_node_aabbs, false_node_aabbs, query_points}) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
+                    tensor.scalar_type() == torch::kFloat32,
+                    op, ": float inputs must be contiguous CUDA float32 tensors");
+    }
+    for (const auto& tensor : {true_sorted_indices, false_sorted_indices, query_order}) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
+                    tensor.scalar_type() == torch::kInt64,
+                    op, ": index inputs must be contiguous CUDA int64 tensors");
+    }
+    TORCH_CHECK(routes.is_cuda() && routes.is_contiguous() &&
+                routes.scalar_type() == torch::kBool,
+                op, ": routes must be contiguous CUDA bool");
+    TORCH_CHECK(query_points.dim() == 3 && query_points.size(2) == dim,
+                op, ": query_points must have shape (B, M, D)");
+    const int64_t B = query_points.size(0);
+    const int64_t M = query_points.size(1);
+    TORCH_CHECK(routes.dim() == 2 && routes.size(0) == B && routes.size(1) == M,
+                op, ": routes must have shape (B, M)");
+    TORCH_CHECK(query_order.dim() == 2 && query_order.size(0) == B && query_order.size(1) == M,
+                op, ": query_order must have shape (B, M)");
+    TORCH_CHECK(true_node_aabbs.dim() == 3 && true_node_aabbs.size(0) == B &&
+                true_node_aabbs.size(1) == true_num_real_nodes &&
+                true_node_aabbs.size(2) == 2 * dim,
+                op, ": true_node_aabbs has incompatible shape");
+    TORCH_CHECK(false_node_aabbs.dim() == 3 && false_node_aabbs.size(0) == B &&
+                false_node_aabbs.size(1) == false_num_real_nodes &&
+                false_node_aabbs.size(2) == 2 * dim,
+                op, ": false_node_aabbs has incompatible shape");
+    TORCH_CHECK(true_sorted_indices.dim() == 2 && true_sorted_indices.size(0) == B &&
+                true_sorted_indices.size(1) == true_num_leaves,
+                op, ": true_sorted_indices has incompatible shape");
+    TORCH_CHECK(false_sorted_indices.dim() == 2 && false_sorted_indices.size(0) == B &&
+                false_sorted_indices.size(1) == false_num_leaves,
+                op, ": false_sorted_indices has incompatible shape");
+    TORCH_CHECK(true_num_leaves >= k && false_num_leaves >= k,
+                op, ": both source counts must be >= k");
+    TORCH_CHECK(threads == 64 || threads == 128 || threads == 256 || threads == 512,
+                op, ": threads must be 64, 128, 256, or 512");
+    for (const auto& tensor : {true_left, true_right, true_leaf, false_left, false_right, false_leaf}) {
+        const bool is_true = tensor.is_same(true_left) || tensor.is_same(true_right) || tensor.is_same(true_leaf);
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == torch::kInt32 &&
+                    tensor.device() == query_points.device() && tensor.dim() == 1 &&
+                    tensor.numel() == (is_true ? true_num_real_nodes : false_num_real_nodes),
+                    op, ": incompatible prepared traversal metadata");
+    }
+    c10::cuda::CUDAGuard device_guard(query_points.device());
+    for (const auto& tensor : {true_node_aabbs, true_sorted_indices,
+                               false_node_aabbs, false_sorted_indices,
+                               routes, query_order}) {
+        TORCH_CHECK(tensor.device() == query_points.device(),
+                    op, ": all inputs must share a device");
+    }
+
+#define DISPATCH_ROUTED_CACHED(D, K) \
+    return launch_query_knn_routed_explicit<D, K>( \
+        true_node_aabbs, true_sorted_indices, false_node_aabbs, false_sorted_indices, \
+        query_points, routes, query_order, true_num_leaves, true_num_real_nodes, \
+        false_num_leaves, false_num_real_nodes, \
+        true_left, true_right, true_leaf, false_left, false_right, false_leaf, threads)
+    if (dim == 2 && k == 4) DISPATCH_ROUTED_CACHED(2, 4);
+    if (dim == 2 && k == 8) DISPATCH_ROUTED_CACHED(2, 8);
+    if (dim == 2 && k == 16) DISPATCH_ROUTED_CACHED(2, 16);
+    if (dim == 3 && k == 4) DISPATCH_ROUTED_CACHED(3, 4);
+    if (dim == 3 && k == 8) DISPATCH_ROUTED_CACHED(3, 8);
+    TORCH_CHECK(dim == 3 && k == 16, op, ": K must be 4, 8, or 16");
+    DISPATCH_ROUTED_CACHED(3, 16);
+#undef DISPATCH_ROUTED_CACHED
+}
+
+#include "point_bins.cuh"

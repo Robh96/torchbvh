@@ -11,8 +11,10 @@ from ._constants import (
     SUPPORTED_DIMS,
 )
 from ._handles import _batched_bvh_data, _temporary_bvh
+from ._geometry import PointGeometry, _source_bvh, _validate_geometry
 from ._query import _build_bvh_batched
 from ._validation import _as_contiguous, _validate_supported_k
+from . import _mls_geometry
 
 
 class _LinearMLSSpatialIndexed(torch.autograd.Function):
@@ -29,6 +31,7 @@ class _LinearMLSSpatialIndexed(torch.autograd.Function):
         query_order,
         queries_per_batch,
         queries_per_head,
+        return_grad,
     ):
         ctx.set_materialize_grads(False)
         outputs = _C.mls_packed_indexed_forward(
@@ -43,6 +46,7 @@ class _LinearMLSSpatialIndexed(torch.autograd.Function):
             MLS_REGULARIZATION,
             MLS_BANDWIDTH_MIN,
             EXACT_DISTANCE_EPSILON,
+            bool(return_grad),
         )
         interpolated, field_gradient, factors, exact_counts = outputs
         ctx.queries_per_batch = int(queries_per_batch)
@@ -108,6 +112,7 @@ class _LinearMLSSpatialIndexed(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -132,6 +137,7 @@ def _linear_mls_spatial_indexed(
         query_order,
         queries_per_batch,
         queries_per_head,
+        return_grad,
     )
     return (values, gradient) if return_grad else values
 
@@ -143,6 +149,7 @@ def _spatial_mls_batched_heads(
     k: int,
     *,
     return_grad: bool,
+    geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Production Morton-ordered MLS with indexed source-position loads."""
     batch, source_count, dim = points.shape
@@ -152,9 +159,9 @@ def _spatial_mls_batched_heads(
     flat_queries = displaced_by_head.detach().reshape(
         batch, heads * queries, dim
     ).contiguous()
-    detached_points = points.detach().contiguous()
+    detached_points = points.detach().contiguous() if geometry is None else geometry._points
 
-    with _temporary_bvh(_build_bvh_batched, detached_points) as bvh:
+    with _source_bvh(_build_bvh_batched, detached_points, geometry) as bvh:
         data = _batched_bvh_data(bvh, "bvh_mls_interpolate_batched_heads")
         query_order = _C.morton_sort_queries_narrow(
             flat_queries, data["scene_min"], data["scene_max"]
@@ -169,6 +176,20 @@ def _spatial_mls_batched_heads(
             dim,
             k,
         )
+
+    if _mls_geometry.eligible(dim, k, channels, batch * heads * queries):
+        result = _mls_geometry.interpolate(
+            displaced_by_head.reshape(batch * heads * queries, dim),
+            detached_points, indices.reshape(batch * heads * queries, k),
+            squared_distances.reshape(batch * heads * queries, k), features, None,
+            query_order.reshape(batch * heads * queries),
+            queries_per_batch=heads * queries, queries_per_head=queries,
+            return_grad=return_grad)
+        if return_grad:
+            values, gradient = result
+            return (values.reshape(batch, queries, heads, channels),
+                    gradient.reshape(batch, queries, heads, dim, channels))
+        return result.reshape(batch, queries, heads, channels)
 
     feature_bank = features.permute(0, 2, 1, 3).reshape(
         batch * heads, source_count, channels
@@ -270,6 +291,7 @@ def _mls_interpolate_single(
     k: int,
     *,
     return_grad: bool,
+    geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _validate_mls_inputs(points, displaced_points, features, k)
     result = _spatial_mls_batched_heads(
@@ -278,6 +300,7 @@ def _mls_interpolate_single(
         _as_contiguous(features).unsqueeze(0).unsqueeze(2),
         k,
         return_grad=return_grad,
+        geometry=geometry,
     )
     if return_grad:
         values, gradient = result
@@ -292,6 +315,7 @@ def _mls_interpolate_batched(
     k: int,
     *,
     return_grad: bool,
+    geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _validate_batched_mls_inputs(points, displaced_points, features, k)
     result = _spatial_mls_batched_heads(
@@ -300,6 +324,7 @@ def _mls_interpolate_batched(
         _as_contiguous(features).unsqueeze(2),
         k,
         return_grad=return_grad,
+        geometry=geometry,
     )
     if return_grad:
         values, gradient = result
@@ -314,6 +339,7 @@ def bvh_mls_interpolate_batched_heads(
     k: int = 8,
     *,
     return_grad: bool = False,
+    geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Batched matching-head local-linear MLS interpolation."""
     prefix = "bvh_mls_interpolate_batched_heads"
@@ -349,12 +375,14 @@ def bvh_mls_interpolate_batched_heads(
     if any(not tensor.is_cuda for tensor in (points, displaced_points, features)):
         raise ValueError(f"{prefix}: inputs must be CUDA tensors")
 
+    _validate_geometry(points, geometry)
     return _spatial_mls_batched_heads(
         _as_contiguous(points),
         _as_contiguous(displaced_points),
         _as_contiguous(features),
         k,
         return_grad=return_grad,
+        geometry=geometry,
     )
 
 
@@ -365,14 +393,16 @@ def mls_interpolate(
     k: int = 8,
     *,
     return_grad: bool = False,
+    geometry: PointGeometry | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Interpolate features for a single or fixed-size batch of point clouds."""
+    _validate_geometry(points, geometry)
     if points.dim() == 3:
         return _mls_interpolate_batched(
-            points, displaced_points, features, k, return_grad=return_grad
+            points, displaced_points, features, k, return_grad=return_grad, geometry=geometry
         )
     return _mls_interpolate_single(
-        points, displaced_points, features, k, return_grad=return_grad
+        points, displaced_points, features, k, return_grad=return_grad, geometry=geometry
     )
 
 

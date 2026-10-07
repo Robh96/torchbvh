@@ -1,0 +1,42 @@
+{
+  "measured_at": "2026-10-07T14:45:56.846975+00:00",
+  "retained_measurement_date": "2026-09-23",
+  "refreshed_rows": 40,
+  "unchanged_rows": 160,
+  "unchanged_rows_text_sha256": "26a0e4a7a6443c53356ad377523a97a9c86d4deacdcae193981c3bbf6d0b4c55",
+  "original_sha256": "d9b6d057ebed297b90bd9f4b54ae7cf3da9afb157b9cf4367eab87954980ba8f",
+  "merged_sha256": "25ba3d926118f2a1230272ab940209c390d66d361ce959f472a31a73cac0122d",
+  "binary_sha256": "e59dcd867daf2233fdf671d058698f1bb2b770dc60dfc07fd743f67af2491366",
+  "environment": {
+    "torch": "2.10.0+cu126",
+    "cuda": "12.6",
+    "gpu": "NVIDIA RTX 3500 Ada Generation Laptop GPU",
+    "scipy": "1.15.2",
+    "cupy": "14.1.0",
+    "torch_cluster": "1.6.3+pt210cu126",
+    "fpsample": "1.0.2",
+    "torch_fpsample": "0.1.0",
+    "dtype": "float32",
+    "knn_k": 4,
+    "mls_k": 4,
+    "channels": 64,
+    "fps_ratio": 0.25,
+    "timing": "median synchronized wall-clock ms; one warmup, three repeats by default",
+    "transfers": "excluded; inputs prestaged in native CPU/GPU memory"
+  },
+  "protocol": {
+    "warmup": 1,
+    "repeats": 3,
+    "statistic": "median",
+    "channels": 64,
+    "k": 4,
+    "inputs": "original seeds and prestaged shapes",
+    "setup": "one-shot build included",
+    "quality": "outside timing",
+    "methods": [
+      "torchbvh",
+      "torchbvh_mls"
+    ]
+  },
+  "torchbvh_source_version": "0.3.2"
+}

@@ -11,7 +11,7 @@ README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="torchbvh",
-    version="0.3.1",
+    version="0.3.2",
     description="GPU-native BVH, k-NN, ray tracing, MLS interpolation, and FPS primitives for PyTorch.",
     long_description=README,
     long_description_content_type="text/markdown",
@@ -48,6 +48,7 @@ setup(
                 "torchbvh/csrc/fps_sample.cu",
                 "torchbvh/csrc/knn_query.cu",
                 "torchbvh/csrc/mls_fused.cu",
+                "torchbvh/csrc/mls_geometry.cu",
                 "torchbvh/csrc/morton_sort.cu",
                 "torchbvh/csrc/ray_query.cu",
             ],

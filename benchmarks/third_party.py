@@ -178,7 +178,8 @@ def _knn_distances(method: str, result, points_gpu: torch.Tensor, queries_gpu: t
     return distances[ordered].reshape(batch, limit, 4).cpu().numpy()
 
 
-def run_knn(case: Case, *, warmup: int = 1, repeats: int = 3) -> list[dict]:
+def run_knn(case: Case, *, warmup: int = 1, repeats: int = 3,
+            methods: tuple[str, ...] | None = None) -> list[dict]:
     p_cpu, q_cpu, p_gpu, q_gpu, p_cp, q_cp = _point_inputs(case)
     reference = _knn_reference(p_cpu, q_cpu)
     flat_p, flat_q = p_gpu.reshape(-1, case.dim), q_gpu.reshape(-1, case.dim)
@@ -206,6 +207,8 @@ def run_knn(case: Case, *, warmup: int = 1, repeats: int = 3) -> list[dict]:
     calls = (bvh_call, scipy_call, cluster_call, cupy_call)
     rows = []
     for method, fn in zip(METHODS["knn"], calls):
+        if methods is not None and method not in methods:
+            continue
         try:
             ms, result = _time_call(fn, gpu=method != "scipy_cKDTree", warmup=warmup, repeats=repeats)
             distances = np.sort(_knn_distances(method, result, p_gpu, q_gpu, p_cpu, q_cpu), axis=-1)
@@ -301,7 +304,8 @@ def _lattice_inputs(case: Case):
     return points, queries, features, grid_features, grid_queries, truth
 
 
-def run_interpolation(case: Case, *, warmup: int = 1, repeats: int = 3) -> list[dict]:
+def run_interpolation(case: Case, *, warmup: int = 1, repeats: int = 3,
+                      methods: tuple[str, ...] | None = None) -> list[dict]:
     points, queries, features, grid_features, grid_queries, truth = _lattice_inputs(case)
 
     def mls_call():
@@ -314,6 +318,8 @@ def run_interpolation(case: Case, *, warmup: int = 1, repeats: int = 3) -> list[
 
     rows = []
     for method, fn in zip(METHODS["interpolation"], (mls_call, grid_call)):
+        if methods is not None and method not in methods:
+            continue
         try:
             ms, result = _time_call(fn, gpu=True, warmup=warmup, repeats=repeats)
             if result.shape != truth.shape or not bool(torch.isfinite(result).all()):

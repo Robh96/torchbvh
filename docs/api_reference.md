@@ -10,6 +10,59 @@ This page is a manual reference for the stable public `torchbvh` API. It does no
 
 ## Class-Based API
 
+### `PointGeometry`
+
+```python
+PointGeometry(points: torch.Tensor, *, experimental_fast: bool = False)
+```
+
+Forward-scoped detached snapshot and point BVH for a single `(N, D)` or batched
+`(B, N, D)` float32 CUDA source tensor. Use the same original tensor in every
+interpolation call. `mls_interpolate` and the single/batched multihead helpers
+accept `geometry=`; conditional MLS accepts `true_geometry=` and
+`false_geometry=`. Existing calls without these arguments keep their lifetime
+and neighbor-search behavior.
+
+The object owns a contiguous clone, Morton ordering, bounds, and topology.
+`validate(points)` rejects another tensor, source mutation, changed storage,
+shape/strides/device/dtype, or use after destruction. Normal PyTorch version
+tracking is required; inference-created tensors are rejected. Mutation through
+`.data` or external pointers is outside this contract. `bvh` borrows metadata
+for medoid selection; do not mutate or destroy that handle yourself.
+`destroy()` is idempotent, and context-manager exit destroys the tree. Autograd
+retains the geometry tensors it needs after exit, so forward-scoped closure
+before backward is supported.
+
+Construct and consume geometry on the same CUDA stream, or apply normal
+PyTorch stream synchronization and tensor lifetime rules. Rebuild geometry on
+every model forward, including graph capture; graph replay executes the captured
+construction and search kernels again. Do not retain position snapshots,
+memberships, medoids, bins, or neighborhoods between training steps.
+
+In 0.3.2, eligible MLS calls automatically use the
+compiled geometry-owner implementation: float32 CUDA, D=2/3, K=4, C per head
+4/8/16/32/64, and at least 4096 total queries. The upper query limit is
+`(2**31-1)//2`. Other shapes use the existing packed/cooperative implementations.
+This selection applies with or without supplied geometry. `experimental_fast`
+remains an accepted compatibility argument; it is no longer required for dispatch.
+
+Qualifying conditional calls additionally select six-bit ordering and
+exact adaptive-bin search: D=2, K=4, C=4/8/16, at least 512 false sources, and
+4096 total routed queries. Ambiguous or unsafe searches retain BVH fallback.
+Ordinary MLS retains its existing neighbor search and ordering. The saved
+per-forward state uses seven float32 geometry values in 2D or eleven in 3D,
+plus an exact-hit mask. Query positions and neighborhoods are never cached
+between forwards. Public signatures, output shapes and first-order gradient
+boundaries remain unchanged.
+
+Feature-gradient atomic accumulation is nondeterministic in both 0.3.1 and
+0.3.2; wide-channel query-gradient accumulation also differs from 0.3.1's
+cooperative reduction. Cancellation-heavy cases can exceed the strict legacy
+gradient-parity tolerances, including comparisons of 0.3.1 with itself.
+Forward agreement does not guarantee identical training trajectories. These
+known differences are documented in [numerical behavior](numerical_behavior.md),
+and the unchanged diagnostic assertions remain available.
+
 ### `BVH`
 
 ```python
@@ -199,7 +252,7 @@ Fixed-size batched shapes:
 - return: `(B, M, C)`
 - with `return_grad=True`: `((B, M, C), (B, M, D, C))`
 
-MLS requires `N >= k`, matching batch sizes and dimensions, and CUDA `float32` inputs on the same device. Non-contiguous `points`, `displaced_points`, and `features` are accepted and copied to contiguous layout internally only when needed. Feature channel count is unrestricted by the Python API; the CUDA route selects packed narrow-channel or cooperative wide-channel kernels internally.
+MLS requires `N >= k`, matching batch sizes and dimensions, and CUDA `float32` inputs on the same device. Non-contiguous inputs are copied to contiguous layout only when needed. Feature channel count remains unrestricted by the Python API; eligible calls use geometry-owner kernels and other calls retain packed/cooperative fallbacks.
 
 BVH construction and discrete neighbor selection are detached. PyTorch gradients flow through the MLS solve to `features` and `displaced_points`. They do not flow
 through BVH construction, neighbor indices, squared distances, or gathered neighbor positions. MLS custom autograd supports first-order gradients; higher-order differentiation is not supported.

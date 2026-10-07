@@ -11,6 +11,7 @@
 #include "implicit_tree.cuh"
 #include "morton.cuh"
 #include <cub/device/device_segmented_radix_sort.cuh>
+#include "medoid_select.cuh"
 
 
 template <int D>
