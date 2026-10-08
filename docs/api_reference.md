@@ -254,11 +254,21 @@ Fixed-size batched shapes:
 
 MLS requires `N >= k`, matching batch sizes and dimensions, and CUDA `float32` inputs on the same device. Non-contiguous inputs are copied to contiguous layout only when needed. Feature channel count remains unrestricted by the Python API; eligible calls use geometry-owner kernels and other calls retain packed/cooperative fallbacks.
 
-BVH construction and discrete neighbor selection are detached. PyTorch gradients flow through the MLS solve to `features` and `displaced_points`. They do not flow
-through BVH construction, neighbor indices, squared distances, or gathered neighbor positions. MLS custom autograd supports first-order gradients; higher-order differentiation is not supported.
+BVH construction, source positions, and discrete neighbor selection are detached.
+PyTorch gradients flow to `features` and `displaced_points`. The MLS backward
+differentiates query-to-neighbor distances and the adaptive lower-median bandwidth
+with the selected neighbors and their order held fixed. This is an analytic
+derivative inside MLS; it does not attach autograd to the detached distance tensors
+returned by k-NN. The bandwidth contribution is zero at or below its floor.
+Neighbor changes, distance-order ties, and the floor boundary are nonsmooth;
+backward uses the selected neighbor branch and zero bandwidth derivative at the
+floor boundary. MLS custom autograd supports first-order gradients only.
 
-`return_grad=True` returns a spatial field-gradient tensor. It is ordinary operator output, not PyTorch autograd metadata. `return_grad=False` returns only
-the interpolated tensor.
+`return_grad=True` returns the fitted linear coefficients as `field_gradient`
+(using the query-minus-neighbor basis). These are ordinary differentiable outputs,
+not the autograd derivative of the adaptive interpolated value with respect to
+the query. Losses on these coefficients also receive adaptive-bandwidth query
+gradients. `return_grad=False` returns only the interpolated tensor.
 
 Unsupported `k` and bad input contracts raise `ValueError`.
 

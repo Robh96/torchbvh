@@ -67,7 +67,12 @@ For each displaced query point:
 8. Return the fitted constant term as the interpolated feature.
 9. When `return_grad=True`, return the fitted spatial slope as the field gradient.
 
-Gradients flow through the MLS solve to `features` and live `displaced_points`. Gradients do not flow through BVH construction, Morton sorting, k-NN selection, integer indices, squared distances, or detached neighbor positions.
+Gradients flow through the MLS solve to `features` and live `displaced_points`,
+including the query dependence of Gaussian distances and the clamped lower-median
+bandwidth. Discrete neighbor identities/order remain fixed during backward.
+Traversal distance tensors and source positions remain detached. The fitted
+linear coefficients returned by `return_grad=True` are not generally the query
+derivative of the adaptive interpolation function.
 
 Why it is fast: a dense differentiable interpolation would either compare each query to all source points or build large intermediate tensors for weights and gradients. MLS uses the exact k-NN result to restrict the solve to `k` local samples, then solves only a small regularized linear system per query. The discrete geometry search is detached, so autograd tracks the continuous MLS solve for `features` and `displaced_points` without recording the BVH traversal, sorting, or integer neighbor selection.
 

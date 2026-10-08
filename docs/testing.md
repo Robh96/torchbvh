@@ -124,7 +124,7 @@ fresh environment, install PyTorch independently, then install the exact sdist
 using default build isolation:
 
 ```bash
-python -m pip install dist/torchbvh-0.3.3.tar.gz
+python -m pip install dist/torchbvh-0.3.4.tar.gz
 python -m pip check
 ```
 

@@ -1,7 +1,7 @@
 """Release contracts exercised above the automatic dispatch threshold.
 
 The independent reference differentiates a double-precision weighted affine
-solve with frozen neighbours/bandwidth, matching the public gradient boundary.
+solve with fixed neighbours and live adaptive bandwidth.
 Sparse upstream gradients isolate derivative correctness from the separately
 retained many-to-one FP32 summation diagnostics.
 """
@@ -37,7 +37,7 @@ def fixture(dim, channels=64):
 def reference(points, queries, features):
     delta = queries[:, :, None, :] - points[:, None, :, :]
     distance = delta.square().sum(-1)
-    bandwidth = distance.detach().sort(-1).values[..., 1:2]
+    bandwidth = distance.sort(-1).values[..., 1:2].clamp_min(1e-12)
     weights = torch.exp(-distance / (2 * bandwidth))
     basis = torch.cat((torch.ones_like(delta[..., :1]), delta), -1)
     matrix = torch.einsum("bmni,bmn,bmnj->bmij", basis, weights, basis)

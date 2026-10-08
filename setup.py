@@ -9,7 +9,7 @@ README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="torchbvh",
-    version="0.3.3",
+    version="0.3.4",
     description="GPU-native BVH, k-NN, ray tracing, MLS interpolation, and FPS primitives for PyTorch.",
     long_description=README,
     long_description_content_type="text/markdown",

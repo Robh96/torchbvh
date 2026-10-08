@@ -74,7 +74,10 @@ The procedural alias is useful in low-level pipelines.
 interpolated = tb.mls_interpolate(points, displaced_pts, features, k=8) # (N, Ch) float32
 ```
 
-`return_grad=True` returns the spatial MLS field gradient. It is data returned by the operator, not PyTorch autograd metadata.
+`return_grad=True` returns the fitted linear coefficients in the
+query-minus-neighbor basis. This output is differentiable data, not the autograd
+query derivative of adaptive MLS. Query autograd includes the change in Gaussian
+bandwidth; source positions and discrete neighbor selection remain detached.
 
 ```python
 interpolated, field_gradient = bvh.interpolate(

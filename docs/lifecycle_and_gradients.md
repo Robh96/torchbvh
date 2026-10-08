@@ -57,7 +57,7 @@ The following are metadata or discrete geometry decisions, not differentiable Py
 - tree topology and handle metadata/lifecycle.
 - k-NN traversal and discrete neighbor selection.
 - integer indices.
-- query squared distances.
+- squared-distance tensors returned by k-NN (MLS differentiates query distances internally).
 - FPS anchor selection.
 - FPS assignment metadata, including nearest-anchor ids, radii, counts, and ordering metadata.
 
@@ -72,9 +72,20 @@ MLS interpolation (`mls_interpolate`, the matching-head API, and `BVH.interpolat
 
 Gradients do not flow to the source `points` passed to MLS wrappers.
 
+MLS query gradients include the change in Gaussian bandwidth with query position.
+The bandwidth is the clamped lower-median squared neighbor distance. Backward
+holds discrete neighbor identities and order fixed, differentiates the selected
+distance analytically, and uses zero bandwidth derivative at or below the floor.
+Neighbor changes, order ties, and the floor boundary are nonsmooth. No autograd
+gradient is attached to traversal outputs or detached source positions.
+
 `conditional_mls_interpolate` follows the same boundary for both source point sets. `torch.where` routes gradients to the selected query branch, and concatenating feature banks routes feature gradients to rows used by the active branch. Inactive query rows and inactive feature-bank rows receive zero gradient. The mask, source positions, route/Morton ordering, neighbor indices, and squared distances are non-differentiable.
 
-`return_grad=True` returns `(interpolated, field_gradient)`. The `field_gradient` tensor is the spatial derivative of the interpolated field. It is ordinary operator output, not PyTorch autograd metadata, and enabling it does not make BVH construction or neighbor selection differentiable.
+`return_grad=True` returns `(interpolated, field_gradient)`. The `field_gradient`
+tensor contains the fitted linear coefficients in the query-minus-neighbor basis.
+It is not generally the query derivative of the adaptive MLS value. Both outputs
+support first-order autograd, including the adaptive bandwidth contribution;
+enabling this output does not differentiate BVH construction or neighbor selection.
 
 `gather_neighbor_values(values, indices)` propagates gradients to `values` only. `indices` are integer selection metadata.
 

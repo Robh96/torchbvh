@@ -466,10 +466,18 @@ __global__ void mls_packed_backward_kernel(
             if constexpr (NeedFeatures) mls_scatter_add<AggregateScatter>(mls_feature_gradient<Routed>(d_features, src, source_count, channels, queries_per_batch / queries_per_head, c), df);
             if constexpr (NeedQuery) {
             const float residual = f - fitted;
+            // Include dh/dq for the selected lower-median neighbour, unless
+            // the bandwidth floor is active. Integer neighbour choices stay fixed.
+            float dsq = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) dsq += delta[j * D + d] * delta[j * D + d];
+            const float bandwidth_term = squared_distances[storage_qrow * K + ((K - 1) / 2)] > bandwidth_min
+                ? ay * residual * weights[j] * dsq / (bandwidth * bandwidth) : 0.0f;
             #pragma unroll
             for (int d = 0; d < D; ++d) {
                 const float term = weights[j] * (residual * G[d + 1] - ay * x[d + 1])
-                    - ay * residual * weights[j] * delta[j * D + d] / bandwidth;
+                    - ay * residual * weights[j] * delta[j * D + d] / bandwidth
+                    + bandwidth_term * delta[((K - 1) / 2) * D + d];
                 if constexpr (ChannelTile == 1) dq[d] += term;
                 else channel_terms[j * D + d] = term;
             }
@@ -997,14 +1005,23 @@ __global__ void mls_fused_backward_kernel(
             }
             const float residual_jc = fval - fitted_jc;
             const float ay_res      = ay_jc * residual_jc;
+            float dsq = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) {
+                const float delta_jd = basis_sh[j * P + 1 + d];
+                dsq += delta_jd * delta_jd;
+            }
+            const float bandwidth_term = squared_distances[storage_qrow * K + ((K - 1) / 2)] > bandwidth_min
+                ? ay_res * w_j * dsq / (bw_sh * bw_sh) : 0.0f;
 
-            // grad_delta_j[d] = w_j*(residual_jc*G[d+1] - ay_jc*x[d+1])
-            //                   - ay_res*w_j*δ_jd / h
+            // The weight derivative includes motion of the selected bandwidth
+            // neighbour as well as motion relative to neighbour j.
             #pragma unroll
             for (int d = 0; d < D; ++d) {
                 const float delta_jd = basis_sh[j * P + 1 + d];
                 partial_dq[d] += w_j * (residual_jc * G[1 + d] - ay_jc * x[1 + d])
-                               - ay_res * w_j * delta_jd / bw_sh;
+                               - ay_res * w_j * delta_jd / bw_sh
+                               + bandwidth_term * basis_sh[((K - 1) / 2) * P + 1 + d];
             }
         }
 

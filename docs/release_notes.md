@@ -1,5 +1,19 @@
 # Release notes
 
+## 0.3.4
+
+Correct MLS query gradients to include the adaptive lower-median Gaussian
+bandwidth derivative in geometry-owner, packed/routed, and cooperative CUDA
+backward kernels. Earlier releases through 0.3.3 froze bandwidth during backward.
+Forward values, fitted linear-coefficient outputs, feature-gradient formulas,
+source-coordinate detachment, and public signatures are unchanged. Query gradients
+and training trajectories can change. No compatibility flag is required.
+
+Clarify that `return_grad=True` returns fitted linear coefficients rather than
+the autograd query derivative of adaptive MLS. Neighbor identities/order remain
+discrete; the bandwidth derivative is zero at or below its floor. See
+[numerical behavior](numerical_behavior.md) for the gradient contract and tests.
+
 ## 0.3.3
 
 Plain `pip install torchbvh` no longer resolves a separate build-time PyTorch.

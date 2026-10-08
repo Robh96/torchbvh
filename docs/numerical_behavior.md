@@ -7,6 +7,24 @@ for dispatch conditions and fallback behavior.
 
 ## Gradients and reproducibility
 
+Release 0.3.4 corrects the frozen-bandwidth backward used through 0.3.3.
+Query gradients now differentiate the adaptive bandwidth as well as each
+neighbor distance. Forward values, fitted linear coefficients, feature-gradient
+formulas, and detached source positions are unchanged. For fixed neighbor order,
+with `delta_j = q - p_j`, `s_j = ||delta_j||^2`, and
+`h = max(s_m, h_min)`, the Gaussian weight derivative is
+
+```text
+dw_j/dq = w_j * (-delta_j / h + s_j * delta_m / h^2)  if s_m > h_min
+          w_j * (-delta_j / h)                       otherwise
+```
+
+Here `m = (k - 1) // 2` is the lower-median slot in ascending distance order.
+The floor boundary uses zero bandwidth derivative; no unique smooth derivative
+is promised at neighbor changes or order ties. Exact-hit behavior is unchanged.
+The optional `field_gradient` output remains the fitted linear coefficients,
+not the query derivative of the adaptive interpolated value.
+
 Feature gradients use float32 atomic additions. Their order can vary between
 runs, including in 0.3.1. Wide-channel query gradients in the geometry-owner
 kernels accumulate channel contributions in a different order from the legacy
@@ -27,7 +45,10 @@ explicit `PointGeometry` objects.
 The maintained contract tests check values and first-order derivatives against
 an independent double-precision weighted linear solve on well-conditioned
 2D/3D cases. They cover query-only, feature-only and combined gradients,
-64 channels, spatial-derivative outputs, and actual production-kernel dispatch.
+64 channels, fitted linear-coefficient outputs, and actual production-kernel dispatch.
+Non-affine tests and FP64 central finite differences check adaptive-bandwidth
+derivatives in geometry-owner, packed/routed, and cooperative kernels, including
+losses on the fitted coefficients and bandwidth-floor controls.
 Additional tests cover exact hits, duplicates, degenerate geometry, inactive
 NaNs, non-contiguous inputs, geometry mutation and lifetime, streams, and CUDA
 graphs. Passing these cases does not establish accuracy for every ill-conditioned

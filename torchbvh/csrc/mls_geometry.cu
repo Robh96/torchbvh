@@ -427,10 +427,18 @@ __global__ void backward_kernel(
             if constexpr (NeedFeatures) atomicAdd(native_feature_gradient(d_features, src, source_count, channels, queries_per_batch / queries_per_head, c), df);
             if constexpr (NeedQuery) {
             const float residual = f - fitted;
+            // h(q) is the clamped lower-median squared distance. Differentiate
+            // its selected neighbour with order fixed; the floor has zero dh.
+            float dsq = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < D; ++d) dsq += delta[j * D + d] * delta[j * D + d];
+            const float bandwidth_term = bandwidth > bandwidth_min
+                ? ay * residual * weights[j] * dsq / (bandwidth * bandwidth) : 0.0f;
             #pragma unroll
             for (int d = 0; d < D; ++d) {
                 const float term = weights[j] * (residual * G[d + 1] - ay * x[d + 1])
-                    - ay * residual * weights[j] * delta[j * D + d] / bandwidth;
+                    - ay * residual * weights[j] * delta[j * D + d] / bandwidth
+                    + bandwidth_term * delta[((K - 1) / 2) * D + d];
                 if constexpr (ChannelTile == 1) dq[d] += term;
                 else channel_terms[j * D + d] = term;
             }
