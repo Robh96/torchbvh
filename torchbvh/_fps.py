@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from . import _C
+from ._extension import _C
 from ._validation import _as_contiguous
 
 

@@ -38,6 +38,12 @@ Install CUDA-enabled PyTorch, a matching CUDA toolkit with NVCC, and a supported
 pip install torchbvh
 ```
 
+Starting with 0.3.3, installation packages the CUDA sources and leaves your
+PyTorch installation unchanged. Importing `torchbvh` does not compile anything.
+The first operation compiles the native extension against your installed
+PyTorch and CUDA toolkit; later operations and Python sessions reuse the cached
+binary. Changing the source or build environment selects a separate cache.
+
 See the [build guide](https://github.com/Robh96/torchbvh/blob/main/docs/testing.md) for compiler and source-install details.
 
 ## Quickstart

@@ -1,5 +1,23 @@
 # Release notes
 
+## 0.3.3
+
+Plain `pip install torchbvh` no longer resolves a separate build-time PyTorch.
+PyTorch is an explicitly managed prerequisite: torchbvh neither installs nor
+replaces it. Installation packages sources, and importing the package does not
+compile the native extension.
+
+The first operation compiles the existing production CUDA kernels against the
+running environment. Subsequent sessions load the cached binary. Cache identities
+include the source, Python/PyTorch build, toolkit, host compiler, compiler flags,
+and GPU targets. Builds are serialized across threads and processes; incomplete
+builds can be retried. CUDA graph capture requires an operation first to warm up
+the extension. See [Testing and builds](testing.md).
+
+The algorithms, compiler optimization flags, public operation signatures, and
+documented numerical limitations are unchanged. The performance figure retains
+its explicitly labeled 0.3.2 measurements.
+
 ## 0.3.2
 
 Eligible ordinary and conditional MLS calls automatically use compiled two-lane

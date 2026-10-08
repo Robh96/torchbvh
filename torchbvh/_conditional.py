@@ -2,7 +2,7 @@
 
 import torch
 
-from . import _C
+from ._extension import _C
 from ._constants import SUPPORTED_DIMS
 from ._handles import _batched_bvh_data, _temporary_bvh
 from ._geometry import PointGeometry, _source_bvh, _validate_geometry

@@ -1,3 +1,8 @@
+from ._extension import _C, _require_torch
+from ._version import __version__
+
+_require_torch()
+
 from ._bvh_class import BVH
 from ._conditional import conditional_mls_interpolate
 from ._constants import SUPPORTED_DIMS, SUPPORTED_K

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch.autograd.function import once_differentiable
 
-from . import _C
+from ._extension import _C
 from ._constants import (
     EXACT_DISTANCE_EPSILON,
     MLS_BANDWIDTH_MIN,

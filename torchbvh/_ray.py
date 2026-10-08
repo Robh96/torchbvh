@@ -7,7 +7,7 @@ from typing import Literal
 import torch
 from torch.autograd.function import once_differentiable
 
-from . import _C
+from ._extension import _C
 
 
 PrimitiveType = Literal["segment", "triangle"]

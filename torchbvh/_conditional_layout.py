@@ -1,7 +1,7 @@
 import torch
 from torch.autograd.function import once_differentiable
 
-from . import _C
+from ._extension import _C
 
 
 class _PackRoutedQueries(torch.autograd.Function):

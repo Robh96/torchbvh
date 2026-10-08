@@ -2,7 +2,7 @@ from collections.abc import Mapping
 
 import torch
 
-from . import _C
+from ._extension import _C
 from ._constants import SUPPORTED_DIMS
 from ._handles import (
     BVHHandle,

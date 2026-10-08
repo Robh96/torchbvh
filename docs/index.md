@@ -17,11 +17,19 @@ pip install torchbvh
 To install from a local source checkout instead:
 
 ```bash
-python -m pip install --upgrade setuptools wheel
-python -m pip install --no-build-isolation .
+python -m pip install .
 ```
 
-`torchbvh` is CUDA-only. Source installs compile against the PyTorch in your environment. PyTorch targets the GPUs visible while building by default; set `TORCH_CUDA_ARCH_LIST` first to target a different or broader set.
+Starting with 0.3.3, installation leaves PyTorch unchanged and packages the native
+sources without compiling them. Importing `torchbvh` requires an existing PyTorch
+installation but does not compile anything. The first operation compiles against
+that PyTorch and the local CUDA toolkit; subsequent Python sessions load the
+cached binary. An incompatible source or build environment selects a new cache.
+
+`torchbvh` operations are CUDA-only. PyTorch targets the GPUs visible at first
+compilation by default; set `TORCH_CUDA_ARCH_LIST` before the first operation to
+target a different or broader set. A compatible CUDA toolkit with NVCC and host
+C++ compiler are still required; CUDA-enabled PyTorch alone does not provide NVCC.
 See [Testing](testing.md) for build and verification guidance.
 
 ## Quickstart
